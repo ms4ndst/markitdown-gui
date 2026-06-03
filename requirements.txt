@@ -1,0 +1,6 @@
+PySide6>=6.10
+markitdown[all]
+# Optional: enable the "OCR images in PDFs" feature in the GUI.
+# Requires an OpenAI-compatible LLM endpoint (OpenAI, Azure OpenAI, LM Studio, etc.)
+markitdown-ocr
+openai
