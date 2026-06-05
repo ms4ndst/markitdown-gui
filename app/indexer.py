@@ -104,7 +104,7 @@ def _is_title_case_heading(line: str) -> bool:
 def _find_repeated_lines(lines: list[str], min_repeats: int = 4) -> set[str]:
     """Identify lines that repeat often enough to be page headers/footers.
 
-    A typical PDF puts the same banner ("Visma Software AB", "Page 3 of 75",
+    A typical PDF puts the same banner ("Acme Software AB", "Page 3 of 75",
     document title) on every page. These get extracted as separate lines and
     would otherwise flood the index. Any non-trivial line that appears
     ``min_repeats`` times or more is treated as boilerplate.

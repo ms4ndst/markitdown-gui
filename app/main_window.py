@@ -1,4 +1,4 @@
-"""Visma-branded MarkItDown GUI main window."""
+"""Catppuccin-themed MarkItDown GUI main window."""
 
 from __future__ import annotations
 
@@ -45,7 +45,16 @@ from .llm_discovery import (
     is_vision_model,
 )
 from .scan_detector import ScanDetector
-from .theme import STYLESHEET, VISMA_AMPLIFY_END, VISMA_WHITE, visma_logo_svg
+from .theme import (
+    ACCENTS,
+    Flavor,
+    PALETTES,
+    apply_catppuccin,
+    catppuccin_cat_svg,
+    current_accent_hex,
+    current_palette,
+    refresh_widgets,
+)
 from .worker import ConversionItem, ConversionWorker, OcrConfig, run_in_thread
 
 
@@ -150,14 +159,30 @@ def _diagnose_test_error(exc: Exception, endpoint: str, model: str) -> str:
 
 
 class FileListDelegate(QStyledItemDelegate):
-    """Paints a small Visma-orange ``SCAN`` pill on items marked as scanned."""
+    """Paints a small Peach-coloured ``SCAN`` pill on items marked as scanned.
+
+    Colours are pulled from the active Catppuccin palette at paint time so a
+    flavor switch propagates without rebuilding the delegate.
+    """
 
     BADGE_TEXT = "SCAN"
-    BADGE_FILL = QColor(VISMA_AMPLIFY_END)
-    BADGE_TEXT_COLOR = QColor(VISMA_WHITE)
     BADGE_MARGIN_RIGHT = 8
     BADGE_PAD_X = 8
     BADGE_PAD_Y = 2
+
+    @staticmethod
+    def _badge_fill() -> QColor:
+        # Peach reads as "warn/special handling" without being alarming
+        # like Red. The semantic role of the badge is "this PDF will be
+        # OCR'd, not text-extracted".
+        return QColor(current_palette().peach)
+
+    @staticmethod
+    def _badge_text_color() -> QColor:
+        # Base for dark flavors, Crust for Latte — Catppuccin's standard
+        # text-on-accent foreground.
+        p = current_palette()
+        return QColor(p.base if p.is_dark else p.crust)
 
     def paint(
         self,
@@ -191,9 +216,9 @@ class FileListDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(QPen(Qt.PenStyle.NoPen))
-        painter.setBrush(self.BADGE_FILL)
+        painter.setBrush(self._badge_fill())
         painter.drawRoundedRect(rect, badge_h / 2, badge_h / 2)
-        painter.setPen(self.BADGE_TEXT_COLOR)
+        painter.setPen(self._badge_text_color())
         painter.setFont(self._badge_font(option.font))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.BADGE_TEXT)
         painter.restore()
@@ -246,9 +271,11 @@ def _svg_pixmap(svg: str, size: QSize) -> QPixmap:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"MarkItDown — Visma  v{__version__}")
+        self.setWindowTitle(f"MarkItDown  v{__version__}")
         self.resize(960, 720)
-        self.setStyleSheet(STYLESHEET)
+        # The Catppuccin stylesheet is set on QApplication in app/main.py;
+        # we don't override it per-window so flavor switches reach every
+        # widget without an extra hop.
 
         self._thread = None
         self._worker: ConversionWorker | None = None
@@ -352,6 +379,7 @@ class MainWindow(QMainWindow):
         body_layout.addWidget(self.progress)
 
         self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("LogView")
         self.log_view.setReadOnly(True)
         self.log_view.setMinimumHeight(140)
         body_layout.addWidget(self.log_view, stretch=1)
@@ -363,6 +391,7 @@ class MainWindow(QMainWindow):
         status = QStatusBar()
         status.showMessage("Ready.")
         self.setStatusBar(status)
+        self._add_theme_picker(status)
 
         # Debounced auto-save: every change schedules a write 500 ms later.
         self._save_timer = QTimer(self)
@@ -373,6 +402,61 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._wire_persistence_signals()
         self._suppress_save = False
+
+    # --- Theme picker -------------------------------------------------
+
+    def _add_theme_picker(self, status: QStatusBar) -> None:
+        """Add a "Theme: [Flavor] / [Accent]" picker to the status bar's
+        right-hand side. Swaps the entire Catppuccin theme at runtime."""
+        wrapper = QWidget()
+        row = QHBoxLayout(wrapper)
+        row.setContentsMargins(0, 0, 6, 0)
+        row.setSpacing(6)
+
+        row.addWidget(QLabel("Theme:"))
+        self.flavor_combo = QComboBox()
+        for flavor in (Flavor.LATTE, Flavor.FRAPPE, Flavor.MACCHIATO, Flavor.MOCHA):
+            self.flavor_combo.addItem(PALETTES[flavor].name, flavor)
+        self.flavor_combo.setCurrentText(current_palette().name)
+        self.flavor_combo.setToolTip(
+            "Catppuccin flavor — Latte (light), Frappé / Macchiato / Mocha (dark)."
+        )
+        self.flavor_combo.currentIndexChanged.connect(self._on_theme_changed)
+        row.addWidget(self.flavor_combo)
+
+        self.accent_combo = QComboBox()
+        for accent in ACCENTS:
+            self.accent_combo.addItem(accent.capitalize(), accent)
+        from .theme import current_accent_name
+        idx = self.accent_combo.findData(current_accent_name())
+        if idx >= 0:
+            self.accent_combo.setCurrentIndex(idx)
+        self.accent_combo.setToolTip("Accent colour — drives buttons, links, selection.")
+        self.accent_combo.currentIndexChanged.connect(self._on_theme_changed)
+        row.addWidget(self.accent_combo)
+
+        status.addPermanentWidget(wrapper)
+
+    def _on_theme_changed(self) -> None:
+        flavor = self.flavor_combo.currentData()
+        accent = self.accent_combo.currentData()
+        if flavor is None or accent is None:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        apply_catppuccin(app, flavor, accent)
+        refresh_widgets(app.allWidgets())
+        self._refresh_hero_logo()
+        self.file_list.viewport().update()  # repaint SCAN badges
+        self._schedule_save()
+
+    def _refresh_hero_logo(self) -> None:
+        """Re-render the cat silhouette in the active accent."""
+        if hasattr(self, "_hero_logo"):
+            self._hero_logo.setPixmap(
+                _svg_pixmap(catppuccin_cat_svg(current_accent_hex()), QSize(48, 48))
+            )
 
     # --- Settings persistence -----------------------------------------
 
@@ -394,6 +478,8 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
 
     def _persist_settings(self) -> None:
+        flavor_data = self.flavor_combo.currentData() if hasattr(self, "flavor_combo") else None
+        accent_data = self.accent_combo.currentData() if hasattr(self, "accent_combo") else None
         data = {
             "input_dir": self.input_dir.text(),
             "output_dir": self.output_dir.text(),
@@ -403,6 +489,10 @@ class MainWindow(QMainWindow):
             "generate_index": self.generate_index_check.isChecked(),
             "embed_images": self.embed_images_check.isChecked(),
             "extract_images": self.extract_images_check.isChecked(),
+            "theme": {
+                "flavor": flavor_data.value if isinstance(flavor_data, Flavor) else "mocha",
+                "accent": accent_data if isinstance(accent_data, str) else "mauve",
+            },
             "ocr": {
                 "enabled": self.ocr_check.isChecked(),
                 "provider": self.ocr_provider_combo.currentText(),
@@ -451,6 +541,28 @@ class MainWindow(QMainWindow):
         if "api_key" in ocr:
             self.ocr_key_edit.setText(ocr["api_key"])
 
+        # Theme: apply the saved flavor/accent and sync the combos. The
+        # theme is also applied in app/main.py at startup, but redoing it
+        # here is cheap and keeps the combos as the single source of truth.
+        theme = cfg.get("theme") or {}
+        if theme.get("flavor") or theme.get("accent"):
+            flavor = Flavor.from_name(theme.get("flavor"))
+            accent = theme.get("accent") or "mauve"
+            if accent not in ACCENTS:
+                accent = "mauve"
+            f_idx = self.flavor_combo.findData(flavor)
+            if f_idx >= 0:
+                self.flavor_combo.setCurrentIndex(f_idx)
+            a_idx = self.accent_combo.findData(accent)
+            if a_idx >= 0:
+                self.accent_combo.setCurrentIndex(a_idx)
+            # Apply for real (combo changes during suppress don't fire the slot).
+            app = QApplication.instance()
+            if app is not None:
+                apply_catppuccin(app, flavor, accent)
+                refresh_widgets(app.allWidgets())
+                self._refresh_hero_logo()
+
     # --- UI builders ---------------------------------------------------
 
     def _build_hero(self) -> QFrame:
@@ -462,7 +574,10 @@ class MainWindow(QMainWindow):
         layout.setSpacing(20)
 
         logo_label = QLabel()
-        logo_label.setPixmap(_svg_pixmap(visma_logo_svg(VISMA_WHITE), QSize(110, 36)))
+        # Cat silhouette in the active accent — re-rendered on flavor/accent
+        # change via `_refresh_hero_logo()`.
+        self._hero_logo = logo_label
+        self._refresh_hero_logo()
         logo_label.setStyleSheet("background: transparent;")
         layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignTop)
 

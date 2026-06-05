@@ -1,3 +1,3 @@
-"""Visma-branded MarkItDown GUI."""
+"""Catppuccin-themed MarkItDown GUI."""
 
 __version__ = "0.1.0"

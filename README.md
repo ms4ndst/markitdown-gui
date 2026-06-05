@@ -1,6 +1,8 @@
-# MarkItDown GUI — Visma
+# MarkItDown GUI — Catppuccin
 
 ![Application screenshot](screenshot.png)
+*Screenshot above predates the Catppuccin rebrand — see the new theme in the
+[Theme](#theme) section.*
 
 A Windows desktop GUI for batch-converting PDFs, Office documents, images,
 audio, HTML, EPUB and more into clean Markdown. Built on top of Microsoft's
@@ -22,8 +24,10 @@ extras layered on top:
    Ollama; a Detect button probes localhost for running servers and lists
    their vision-capable models.
 
-The UI follows the Visma brand: Visma Purple primary action, Amplify gradient
-hero band, Visma Text typography, white-dominant body.
+The UI is themed with [Catppuccin](https://github.com/catppuccin/catppuccin),
+defaulting to **Mocha** with a **Mauve** accent. All four flavors
+(Latte / Frappé / Macchiato / Mocha) plus nine accents are selectable at
+runtime from the status-bar dropdowns; the choice persists to `config.json`.
 
 ---
 
@@ -35,7 +39,7 @@ hero band, Visma Text typography, white-dominant body.
 - Mirror folder structure (preserve subdirectories) or flatten
 - Overwrite protection — opt in to replace existing `.md` files
 - Background thread keeps the UI responsive; cancel any time
-- Live progress bar + dark conversion log (Visma Black panel)
+- Live progress bar + dark conversion log (Catppuccin Crust panel, terminal-style)
 - All settings auto-persist to a JSON config file (see [Configuration](#configuration))
 
 ### Supported input formats *(from upstream MarkItDown)*
@@ -257,7 +261,11 @@ smallest reliable vision model.
 All UI state auto-saves to a JSON config file the moment you change it
 (debounced to 500 ms). Loaded on startup.
 
-**Path:** `%LOCALAPPDATA%\Visma\MarkItDown\config.json` *(Windows)*
+**Path:** `%LOCALAPPDATA%\MarkItDown\MarkItDown\config.json` *(Windows)*
+
+On first launch after the Catppuccin rebrand, an existing config at the
+legacy `%LOCALAPPDATA%\Visma\MarkItDown\config.json` location is migrated
+automatically — your API keys and preferences survive the change.
 
 ```json
 {
@@ -275,7 +283,11 @@ All UI state auto-saves to a JSON config file the moment you change it
     "provider": "Mistral"
   },
   "output_dir": "C:\\Users\\you\\Downloads\\markdown_output",
-  "overwrite": false
+  "overwrite": false,
+  "theme": {
+    "flavor": "mocha",
+    "accent": "mauve"
+  }
 }
 ```
 
@@ -305,7 +317,7 @@ app/
   scan_detector.py        # Async pdfplumber-based scanned-PDF detection
   llm_discovery.py        # Provider presets + local LLM probing
   config.py               # JSON config load/save (QStandardPaths)
-  theme.py                # Visma brand palette + Qt stylesheet
+  theme.py                # Catppuccin palettes (4 flavors) + Qt stylesheet + cat hero icon
 markitdown/               # Vendored upstream MarkItDown source (see Credits)
   packages/
     markitdown/           # The core library imported by the GUI
@@ -444,8 +456,8 @@ each annotated with `# Local patch (markitdown_gui):` comments:
 
 ## Credits
 
-This project is a thin Visma-branded GUI wrapper around the excellent work
-done by the Microsoft AutoGen team:
+This project is a thin Catppuccin-themed GUI wrapper around the excellent
+work done by the Microsoft AutoGen team:
 
 - **[MarkItDown](https://github.com/microsoft/markitdown)** — the core
   file-to-Markdown conversion library (MIT, © Microsoft Corporation). The
@@ -486,10 +498,37 @@ distribution.
 
 ---
 
-## Brand notes
+## Theme
 
-The hero band, primary CTA, and progress bar use the Visma Purple → Amplify
-gradient. The wordmark in the hero is a placeholder rendered with the brand
-font stack; for production builds, download the official Visma logo from
-[design.visma.com](https://design.visma.com) and swap the
-`visma_logo_svg()` call in [`app/theme.py`](app/theme.py) for the real asset.
+The UI is themed with [Catppuccin](https://github.com/catppuccin/catppuccin),
+a soothing pastel theme that ships four flavors:
+
+| Flavor | Type | Best for |
+|---|---|---|
+| **Latte** | Light | Daytime work, high-ambient-light environments |
+| **Frappé** | Dark, warm | Soft dark mode, lowest contrast of the dark trio |
+| **Macchiato** | Dark, medium | Balanced dark mode |
+| **Mocha** | Dark, deepest | High-contrast dark mode — **the default** |
+
+Nine accents are selectable: **Mauve** (default), Blue, Lavender, Peach,
+Pink, Teal, Sky, Green, Rosewater. The accent drives the primary CTA, the
+file-list selection, focus rings, progress bar, and the cat silhouette in
+the hero.
+
+Both pickers live in the **status bar (bottom-right)**:
+
+> *Theme:* [`Mocha ▾`] [`Mauve ▾`]
+
+Changes apply instantly and persist to `config.json`. Colours are assigned
+by semantic role (Base / Surface / Text / Accent / etc.) — not by hex code —
+so swapping a flavor preserves the contrast hierarchy automatically. See
+[`app/theme.py`](app/theme.py) for the palette definitions and the QSS
+builder.
+
+The SCAN badge on scanned PDFs uses the **Peach** colour (warn-without-alarm
+semantics, similar to Yellow) regardless of accent — it shouldn't fight with
+the user's chosen primary colour.
+
+### Attribution
+
+> Theme: [Catppuccin](https://github.com/catppuccin/catppuccin) — MIT-licensed.

@@ -1,8 +1,12 @@
 """Persistent settings stored in a JSON config file.
 
 The file lives under the OS's standard per-user app-config location, which on
-Windows is ``%APPDATA%\\VismaMarkItDown\\config.json``. The path is exposed via
-``config_path()`` so the user can inspect or edit it directly.
+Windows is ``%LOCALAPPDATA%\\MarkItDown\\MarkItDown\\config.json``. The path is
+exposed via ``config_path()`` so the user can inspect or edit it directly.
+
+If a config from the previous ``Visma\\MarkItDown\\`` location is found and the
+new path has no file yet, it is migrated over automatically on first read —
+existing API keys and preferences survive the Catppuccin rebrand.
 
 The API key is persisted in **plain text**. This is the simplest behaviour and
 matches what every other GUI tool with a "Save API key" checkbox does. If you
@@ -14,6 +18,7 @@ variable instead.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +26,7 @@ from PySide6.QtCore import QStandardPaths
 
 
 CONFIG_FILENAME = "config.json"
-FALLBACK_APP_DIR = "VismaMarkItDown"
+FALLBACK_APP_DIR = "MarkItDown"
 
 
 def config_path() -> Path:
@@ -30,7 +35,7 @@ def config_path() -> Path:
     Relies on QApplication.setOrganizationName / setApplicationName having been
     called before this is invoked (see ``app/main.py``). With those set,
     ``AppConfigLocation`` on Windows resolves to
-    ``%LOCALAPPDATA%\\Visma\\MarkItDown\\`` — we just drop ``config.json`` into
+    ``%LOCALAPPDATA%\\MarkItDown\\MarkItDown\\`` — we drop ``config.json`` into
     that directory.
     """
     base = QStandardPaths.writableLocation(
@@ -41,15 +46,41 @@ def config_path() -> Path:
     return Path.home() / ".config" / FALLBACK_APP_DIR / CONFIG_FILENAME
 
 
-def load_config() -> dict[str, Any]:
-    """Return the stored config dict; empty dict if the file is missing/invalid."""
-    path = config_path()
+def _legacy_visma_config_path() -> Path | None:
+    """Return the pre-rebrand config path, or None if it can't be resolved."""
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    return Path(local) / "Visma" / "MarkItDown" / CONFIG_FILENAME
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
-        return {}
+        return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
+        return None
+
+
+def load_config() -> dict[str, Any]:
+    """Return the stored config dict; empty dict if the file is missing/invalid.
+
+    Performs a one-time migration from the legacy Visma path if (and only if)
+    the new location has no config yet.
+    """
+    data = _read_json(config_path())
+    if data is not None:
+        return data
+
+    legacy = _legacy_visma_config_path()
+    if legacy is not None:
+        legacy_data = _read_json(legacy)
+        if legacy_data is not None:
+            save_config(legacy_data)
+            return legacy_data
+
+    return {}
 
 
 def save_config(data: dict[str, Any]) -> None:
