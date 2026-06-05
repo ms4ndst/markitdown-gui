@@ -64,6 +64,38 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
 - Filters out repeated page headers/footers and code-like lines
 - Groups endpoints by their first path segment
 
+### Embed document images as base64 *(off by default)*
+- Works on **PDF, DOCX, PPTX, XLSX, EPUB** — not just PDFs
+- Appends embedded images to the Markdown as `data:` URIs so the output stays
+  self-contained (no sidecar files)
+- For PDFs, uses PyMuPDF and groups images under **Embedded images** by page;
+  the same image referenced from multiple pages is de-duplicated and sub-4px
+  spacer/rule artefacts are skipped
+- For DOCX, MarkItDown's `mammoth` converter emits *truncated*
+  `![](data:image/png;base64...)` placeholders with no real bytes — the
+  rewriter substitutes the real base64 pulled from `word/media/` in document
+  order so the resulting `data:` URIs actually display
+- For PPTX / XLSX / EPUB (where MarkItDown drops images entirely), the
+  rewriter pulls them straight from the source ZIP and appends an
+  **Embedded images** section
+- Runs as a post-processing step, so it composes with table detection and OCR
+
+### Extract document images to files *(off by default)*
+- Works on **PDF, DOCX, PPTX, XLSX, EPUB** — not just PDFs
+- Writes each embedded image to an `images/` subfolder next to the output
+  `.md` and links it with a relative path
+- PDFs are rasterised to PNG via PyMuPDF; other formats preserve the original
+  bytes and file extension (`.png`, `.jpg`, etc.) so nothing is re-encoded
+- For DOCX, every truncated `![](data:image/png;base64...)` placeholder
+  MarkItDown emits is rewritten **in place** to point at the on-disk file —
+  no broken `base64...` URIs are left in the output
+- Identical images are **deduped by SHA-256** of the bytes — a logo
+  referenced 50× in a Word document is written once
+- Filenames are prefixed with the `.md` stem (`<stem>_image<N>.png`,
+  `<stem>_p<page>_<xref>.png` for PDFs) so several documents can share one
+  `images/` folder without colliding
+- Mutually exclusive with the base64 option — ticking one clears the other
+
 ### Scanned-PDF detection *(automatic)*
 - Every queued PDF is probed asynchronously after being added
 - Pages with images but no extractable text are counted as scanned
@@ -152,6 +184,11 @@ scan-vs-text status in the background; scanned ones get a **SCAN** badge.
 - *Overwrite existing .md files* — needed if you re-run a conversion.
 - *Mirror input folder structure in output* — preserves subdirectories.
 - *Detect tables in PDFs* — uses the table-aware converter.
+- *Embed document images as base64* — appends embedded images (PDF, DOCX,
+  PPTX, XLSX, EPUB) to the Markdown as real `data:` URIs (off by default).
+- *Extract document images to files* — writes embedded images to an `images/`
+  subfolder, rewrites inline references to point at them, and dedupes by
+  content hash (off by default; mutually exclusive with base64).
 - *Generate index.md for large files* — only fires for outputs > 500 lines.
 
 ### 4. OCR (optional)
@@ -225,6 +262,8 @@ All UI state auto-saves to a JSON config file the moment you change it
 ```json
 {
   "detect_tables": true,
+  "embed_images": false,
+  "extract_images": false,
   "generate_index": true,
   "input_dir": "C:\\Users\\you\\Downloads",
   "mirror": true,
@@ -260,6 +299,8 @@ app/
   main_window.py          # MainWindow + FileListDelegate (SCAN badge)
   worker.py               # ConversionWorker (QThread), OcrConfig, per-file routing
   pdf_table_converter.py  # PdfPlumberTableConverter — tables + font-size headings
+  pdf_image_extractor.py  # Image extraction + inline-URI rewriting for PDF/OOXML/EPUB
+  markdown_cleanup.py     # strip_empty_headings() — kills MD042 violations
   indexer.py              # build_index() — sidecar <name>.index.md generator
   scan_detector.py        # Async pdfplumber-based scanned-PDF detection
   llm_discovery.py        # Provider presets + local LLM probing
@@ -295,6 +336,42 @@ the default `PdfConverter` for `.pdf` inputs) does this per page:
 5. **Promote heading lines** by font-size ratio against body:
    `≥ 1.8× → # heading`, `≥ 1.45× → ##`, `≥ 1.2× → ###`.
 6. **Filter heading noise** — < 3 alphabetic chars or contains `|` → skip.
+
+### Empty-heading cleanup *(always on)*
+
+mammoth (MarkItDown's `.docx` converter) emits two patterns that fail
+markdownlint's `MD042 / no-empty-headings` rule:
+
+- A bare `#` / `##` on a line by itself — comes from a Word paragraph
+  styled as *Heading X* that the author left empty.
+- `## ![alt](url)` — a heading whose entire content is an inline image,
+  with no navigable text.
+
+`markdown_cleanup.strip_empty_headings()` runs unconditionally after all
+image post-processing and before the file is written. It deletes the first
+pattern outright and demotes the second to a bare image (the image
+survives, only the heading prefix is removed). A real Word DOCX dump
+typically loses ~20 headings to this pass.
+
+### How document image extraction works
+
+`pdf_image_extractor.py` runs as a post-processing step on `text_content`
+after MarkItDown finishes. It branches by source format and by mode:
+
+| Source | What MarkItDown emits | What the extractor does |
+|---|---|---|
+| PDF | Text only; no images in `text_content` | Walks the PDF via PyMuPDF, dedupes images by `xref`, appends an **Embedded images** section grouped by page (base64 mode) or rasterises to PNG files (file mode). |
+| DOCX | Text + **truncated** `![](data:image/png;base64...)` placeholders per image-reference | Reads `word/media/` from the ZIP, sorts by trailing image number, then rewrites each placeholder in document order — to the real base64 bytes (embed mode) or to an on-disk file path (file mode). |
+| PPTX / XLSX / EPUB | Text only; images dropped | Reads `ppt/media/`, `xl/media/`, or walks the EPUB ZIP by image extension. Appends an **Embedded images** section. |
+| Other (txt, html, csv…) | Text only | Logs `image extraction not supported for '<ext>' files` and exits cleanly. |
+
+In file mode, identical images (SHA-256 of the decoded bytes) share one
+file on disk — a logo referenced 50× becomes one PNG referenced 50×.
+Filenames are prefixed with the output `.md` stem so multiple documents can
+write into the same `images/` folder without collision.
+
+PyMuPDF (`fitz`) is only required for the PDF branch; the OOXML and EPUB
+branches use Python's stdlib `zipfile` and `hashlib` only.
 
 ### How per-file converter routing works
 

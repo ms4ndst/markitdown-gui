@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .config import config_path, load_config, save_config
 from .llm_discovery import (
     LocalLLMDiscovery,
@@ -245,7 +246,7 @@ def _svg_pixmap(svg: str, size: QSize) -> QPixmap:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("MarkItDown — Visma")
+        self.setWindowTitle(f"MarkItDown — Visma  v{__version__}")
         self.resize(960, 720)
         self.setStyleSheet(STYLESHEET)
 
@@ -284,16 +285,9 @@ class MainWindow(QMainWindow):
         self.file_list.setItemDelegate(FileListDelegate(self.file_list))
         body_layout.addWidget(self.file_list, stretch=2)
 
-        options_row = QHBoxLayout()
         self.overwrite_check = QCheckBox("Overwrite existing .md files")
         self.mirror_check = QCheckBox("Mirror input folder structure in output")
         self.mirror_check.setChecked(True)
-        self.detect_tables_check = QCheckBox("Detect tables in PDFs")
-        self.detect_tables_check.setChecked(True)
-        self.detect_tables_check.setToolTip(
-            "Use pdfplumber to find ruled tables in PDFs and emit them as\n"
-            "Markdown tables instead of a vertical list of cells."
-        )
         self.generate_index_check = QCheckBox("Generate index.md for large files")
         self.generate_index_check.setChecked(True)
         self.generate_index_check.setToolTip(
@@ -301,15 +295,52 @@ class MainWindow(QMainWindow):
             "<name>.index.md listing headings and API endpoints with\n"
             "line numbers so Claude can jump straight to relevant sections."
         )
-        options_row.addWidget(self.overwrite_check)
-        options_row.addSpacing(20)
-        options_row.addWidget(self.mirror_check)
-        options_row.addSpacing(20)
-        options_row.addWidget(self.detect_tables_check)
-        options_row.addSpacing(20)
-        options_row.addWidget(self.generate_index_check)
-        options_row.addStretch(1)
-        body_layout.addLayout(options_row)
+
+        self.detect_tables_check = QCheckBox("Detect tables in PDFs")
+        self.detect_tables_check.setChecked(True)
+        self.detect_tables_check.setToolTip(
+            "Use pdfplumber to find ruled tables in PDFs and emit them as\n"
+            "Markdown tables instead of a vertical list of cells."
+        )
+        self.embed_images_check = QCheckBox("Embed document images as base64")
+        self.embed_images_check.setChecked(False)
+        self.embed_images_check.setToolTip(
+            "Extract embedded images from PDF, DOCX, PPTX, XLSX and EPUB\n"
+            "files and append them to the Markdown as base64 data: URIs.\n"
+            "Output stays self-contained (no separate image files).\n"
+            "PDFs require PyMuPDF; other formats use stdlib only."
+        )
+        self.extract_images_check = QCheckBox("Extract document images to files")
+        self.extract_images_check.setChecked(False)
+        self.extract_images_check.setToolTip(
+            "Extract embedded images from PDF, DOCX, PPTX, XLSX and EPUB\n"
+            "files into an 'images/' subfolder next to the .md, and link\n"
+            "them from the Markdown with relative paths. Keeps the .md\n"
+            "small. PDFs are rasterised to PNG (requires PyMuPDF); other\n"
+            "formats preserve the original image bytes and extension."
+        )
+        # The two image modes are mutually exclusive — base64 inlines the image,
+        # file extraction links to it. Ticking one clears the other.
+        self.embed_images_check.toggled.connect(self._on_embed_images_toggled)
+        self.extract_images_check.toggled.connect(self._on_extract_images_toggled)
+
+        general_row = QHBoxLayout()
+        general_row.addWidget(self.overwrite_check)
+        general_row.addSpacing(20)
+        general_row.addWidget(self.mirror_check)
+        general_row.addSpacing(20)
+        general_row.addWidget(self.generate_index_check)
+        general_row.addStretch(1)
+        body_layout.addLayout(general_row)
+
+        pdf_row = QHBoxLayout()
+        pdf_row.addWidget(self.detect_tables_check)
+        pdf_row.addSpacing(20)
+        pdf_row.addWidget(self.embed_images_check)
+        pdf_row.addSpacing(20)
+        pdf_row.addWidget(self.extract_images_check)
+        pdf_row.addStretch(1)
+        body_layout.addLayout(pdf_row)
 
         body_layout.addLayout(self._build_ocr_row())
 
@@ -351,6 +382,7 @@ class MainWindow(QMainWindow):
             line.textChanged.connect(self._schedule_save)
         for cb in (self.overwrite_check, self.mirror_check,
                    self.detect_tables_check, self.generate_index_check,
+                   self.embed_images_check, self.extract_images_check,
                    self.ocr_check):
             cb.toggled.connect(self._schedule_save)
         self.ocr_provider_combo.currentIndexChanged.connect(self._schedule_save)
@@ -369,6 +401,8 @@ class MainWindow(QMainWindow):
             "mirror": self.mirror_check.isChecked(),
             "detect_tables": self.detect_tables_check.isChecked(),
             "generate_index": self.generate_index_check.isChecked(),
+            "embed_images": self.embed_images_check.isChecked(),
+            "extract_images": self.extract_images_check.isChecked(),
             "ocr": {
                 "enabled": self.ocr_check.isChecked(),
                 "provider": self.ocr_provider_combo.currentText(),
@@ -392,6 +426,8 @@ class MainWindow(QMainWindow):
             ("mirror", self.mirror_check),
             ("detect_tables", self.detect_tables_check),
             ("generate_index", self.generate_index_check),
+            ("embed_images", self.embed_images_check),
+            ("extract_images", self.extract_images_check),
         ):
             if key in cfg:
                 widget.setChecked(bool(cfg[key]))
@@ -575,6 +611,14 @@ class MainWindow(QMainWindow):
             self.ocr_model_combo.blockSignals(False)
         if preset.hint:
             self.statusBar().showMessage(f"{preset.name}: {preset.hint}", 15000)
+
+    def _on_embed_images_toggled(self, on: bool) -> None:
+        if on and self.extract_images_check.isChecked():
+            self.extract_images_check.setChecked(False)
+
+    def _on_extract_images_toggled(self, on: bool) -> None:
+        if on and self.embed_images_check.isChecked():
+            self.embed_images_check.setChecked(False)
 
     def _on_ocr_toggled(self, enabled: bool) -> None:
         for w in getattr(self, "_ocr_field_widgets", []):
@@ -986,6 +1030,8 @@ class MainWindow(QMainWindow):
             overwrite=self.overwrite_check.isChecked(),
             detect_pdf_tables=self.detect_tables_check.isChecked(),
             generate_index=self.generate_index_check.isChecked(),
+            embed_pdf_images=self.embed_images_check.isChecked(),
+            extract_pdf_images=self.extract_images_check.isChecked(),
             ocr=OcrConfig(
                 enabled=self.ocr_check.isChecked(),
                 model=self.ocr_model_combo.currentText().strip() or "gpt-4o",

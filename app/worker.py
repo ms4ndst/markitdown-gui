@@ -39,6 +39,8 @@ class ConversionWorker(QObject):
         overwrite: bool,
         detect_pdf_tables: bool = False,
         generate_index: bool = False,
+        embed_pdf_images: bool = False,
+        extract_pdf_images: bool = False,
         ocr: OcrConfig | None = None,
     ) -> None:
         super().__init__()
@@ -46,6 +48,8 @@ class ConversionWorker(QObject):
         self._overwrite = overwrite
         self._detect_pdf_tables = detect_pdf_tables
         self._generate_index = generate_index
+        self._embed_pdf_images = embed_pdf_images
+        self._extract_pdf_images = extract_pdf_images
         self._ocr = ocr or OcrConfig()
         self._cancelled = False
 
@@ -159,6 +163,17 @@ class ConversionWorker(QObject):
         success = 0
         failure = 0
 
+        if self._embed_pdf_images:
+            self.log.emit(
+                "Image handling: embed as base64 "
+                "(PDF, DOCX, PPTX, XLSX, EPUB)."
+            )
+        elif self._extract_pdf_images:
+            self.log.emit(
+                "Image handling: extract to files in 'images/' subfolder "
+                "(PDF, DOCX, PPTX, XLSX, EPUB)."
+            )
+
         for index, item in enumerate(self._items):
             if self._cancelled:
                 self.log.emit("Conversion cancelled by user.")
@@ -175,14 +190,89 @@ class ConversionWorker(QObject):
                     )
 
                 result = md.convert(str(item.source))
-                item.destination.parent.mkdir(parents=True, exist_ok=True)
-                item.destination.write_text(
-                    result.text_content, encoding="utf-8"
+                text_content = result.text_content
+
+                images_md = ""
+                if self._embed_pdf_images:
+                    # MarkItDown emits *truncated* `data:image/png;base64...`
+                    # placeholders for .docx — the URI has no real bytes.
+                    # Replace each placeholder with the actual base64 pulled
+                    # from the source document so the embedded images are
+                    # real, not literal "...".
+                    if "data:image/" in text_content:
+                        from .pdf_image_extractor import (
+                            rewrite_truncated_uris_to_base64,
+                        )
+
+                        text_content, _ = rewrite_truncated_uris_to_base64(
+                            text_content,
+                            item.source,
+                            log=self.log.emit,
+                        )
+                    else:
+                        # Formats markitdown doesn't inline at all (PDF,
+                        # most PPTX, all XLSX/EPUB) — extract from source.
+                        from .pdf_image_extractor import (
+                            extract_document_images_markdown,
+                        )
+
+                        images_md = extract_document_images_markdown(
+                            item.source, log=self.log.emit
+                        )
+                elif self._extract_pdf_images:
+                    # Rewrite every inline image (full base64 OR truncated
+                    # placeholder) to a relative file link, writing the
+                    # bytes to <md_dir>/images/. Handles .docx (truncated
+                    # placeholders, bytes pulled from word/media) and any
+                    # converter that emits real base64.
+                    from .pdf_image_extractor import (
+                        rewrite_inline_images_to_files,
+                    )
+
+                    text_content, rewritten = rewrite_inline_images_to_files(
+                        text_content,
+                        item.source,
+                        item.destination,
+                        log=self.log.emit,
+                    )
+                    # If nothing was inline (PDF, most PPTX, XLSX, EPUB),
+                    # fall back to pulling images out of the source file
+                    # directly and appending the section at the end.
+                    if rewritten == 0:
+                        from .pdf_image_extractor import (
+                            extract_document_images_to_files,
+                        )
+
+                        images_md = extract_document_images_to_files(
+                            item.source,
+                            item.destination,
+                            log=self.log.emit,
+                        )
+                if images_md:
+                    text_content = (
+                        text_content.rstrip() + "\n\n" + images_md + "\n"
+                    )
+
+                # Strip empty / image-only headings that mammoth leaves
+                # behind in DOCX output — they lint as MD042 in any
+                # markdown linter and break tables of contents.
+                from .markdown_cleanup import strip_empty_headings
+
+                text_content, removed_headings = strip_empty_headings(
+                    text_content
                 )
+                if removed_headings:
+                    self.log.emit(
+                        f"  -> cleaned up {removed_headings} empty / "
+                        "image-only heading(s)"
+                    )
+
+                item.destination.parent.mkdir(parents=True, exist_ok=True)
+                item.destination.write_text(text_content, encoding="utf-8")
 
                 success += 1
                 self.file_done.emit(str(item.source), str(item.destination))
-                char_count = len(result.text_content)
+                char_count = len(text_content)
                 self.log.emit(f"  -> {item.destination} ({char_count} chars)")
                 if char_count < 50:
                     self.log.emit(

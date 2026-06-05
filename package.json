@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@visma-ai/skills": "^4.0.1"
+  }
+}
