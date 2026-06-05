@@ -1,8 +1,6 @@
 # MarkItDown GUI — Catppuccin
 
 ![Application screenshot](screenshot.png)
-*Screenshot above predates the Catppuccin rebrand — see the new theme in the
-[Theme](#theme) section.*
 
 A Windows desktop GUI for batch-converting PDFs, Office documents, images,
 audio, HTML, EPUB and more into clean Markdown. Built on top of Microsoft's
