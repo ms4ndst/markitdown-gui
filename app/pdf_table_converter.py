@@ -278,7 +278,10 @@ def _format_band(page: Any, top: float, bottom: float, body_size: float) -> str:
     return "\n".join(out).strip()
 
 
-def _convert_page(page: Any) -> str:
+def _convert_page(
+    page: Any,
+    image_markers: list[tuple[float, str]] = (),
+) -> str:
     body_size = _body_font_size(page)
 
     try:
@@ -294,21 +297,44 @@ def _convert_page(page: Any) -> str:
 
     accepted.sort(key=lambda x: x[0][1])
 
-    if not accepted:
+    if not accepted and not image_markers:
         return _format_band(page, 0.0, float(page.height), body_size)
+
+    # Tables advance the cursor past their bbox (text inside the table is
+    # captured by the table itself). Image markers are zero-height anchors
+    # at their top-y — text around the image is still extracted from the
+    # surrounding bands, since the image lives on top of the text layer.
+    # Ties at the same y put tables first so a table's contents aren't
+    # split by an image that happens to sit on its border.
+    obstacles: list[tuple[float, float, str, bool]] = [
+        (bbox[1], bbox[3], md, True) for bbox, md in accepted
+    ]
+    obstacles.extend(
+        (float(y), float(y), placeholder, False)
+        for y, placeholder in image_markers
+    )
+    obstacles.sort(key=lambda o: (o[0], 0 if o[3] else 1))
 
     chunks: list[tuple[float, str]] = []
     cursor = 0.0
     page_bottom = float(page.height)
 
-    for bbox, md in accepted:
-        top, bottom = bbox[1], bbox[3]
+    for top, bottom, md, is_table in obstacles:
         if top > cursor:
             band = _format_band(page, cursor, top, body_size)
             if band:
                 chunks.append((cursor, band))
         chunks.append((top, md))
-        cursor = bottom
+        if is_table:
+            cursor = bottom
+        else:
+            # Image marker is zero-height. Advance cursor to its top so the
+            # next band starts there — text inside the image's bbox is
+            # captured by that next band (the image sits on top of the
+            # text layer, not in place of it). Without this, the next band
+            # would re-extract everything from the previous cursor and
+            # duplicate text we already emitted.
+            cursor = max(cursor, top)
 
     if cursor < page_bottom:
         band = _format_band(page, cursor, page_bottom, body_size)
@@ -320,7 +346,17 @@ def _convert_page(page: Any) -> str:
 
 
 class PdfPlumberTableConverter(DocumentConverter):
-    """PDF converter that emits proper Markdown tables for ruled tables."""
+    """PDF converter that emits proper Markdown tables for ruled tables.
+
+    When ``inline_images`` is ``True``, a comment-style placeholder is
+    emitted at every embedded image's on-page y-position so the worker can
+    later swap each one for either a file link (extract mode) or a base64
+    data URI (embed mode). The placeholders mean images land at their
+    original spot in the document rather than in an appendix.
+    """
+
+    def __init__(self, *, inline_images: bool = False) -> None:
+        self._inline_images = inline_images
 
     def accepts(
         self,
@@ -340,14 +376,24 @@ class PdfPlumberTableConverter(DocumentConverter):
         stream_info: StreamInfo,
         **kwargs: Any,
     ) -> DocumentConverterResult:
-        pdf_bytes = io.BytesIO(file_stream.read())
+        raw_bytes = file_stream.read()
+        pdf_bytes = io.BytesIO(raw_bytes)
+
+        image_markers_by_page: dict[int, list[tuple[float, str]]] = {}
+        if self._inline_images:
+            try:
+                from .pdf_image_extractor import iter_pdf_image_markers
+                image_markers_by_page = iter_pdf_image_markers(raw_bytes)
+            except Exception:
+                image_markers_by_page = {}
 
         try:
             page_chunks: list[str] = []
             with pdfplumber.open(pdf_bytes) as pdf:
-                for page in pdf.pages:
+                for page_index, page in enumerate(pdf.pages):
+                    markers = image_markers_by_page.get(page_index, [])
                     try:
-                        page_md = _convert_page(page)
+                        page_md = _convert_page(page, markers)
                     except Exception:
                         page_md = (page.extract_text() or "").strip()
                     if page_md.strip():

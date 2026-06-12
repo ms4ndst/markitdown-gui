@@ -68,34 +68,40 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
 
 ### Embed document images as base64 *(off by default)*
 - Works on **PDF, DOCX, PPTX, XLSX, EPUB** — not just PDFs
-- Appends embedded images to the Markdown as `data:` URIs so the output stays
+- Each embedded image becomes an inline `data:` URI so the output stays
   self-contained (no sidecar files)
-- For PDFs, uses PyMuPDF and groups images under **Embedded images** by page;
-  the same image referenced from multiple pages is de-duplicated and sub-4px
-  spacer/rule artefacts are skipped
+- **For PDFs, images are placed at their original on-page position** — the
+  table-aware converter emits a placeholder at each image's y-coordinate
+  and the post-processor swaps it for a real `data:` URI. This requires
+  *Detect tables in PDFs*, which is auto-ticked when you enable an image
+  mode
 - For DOCX, MarkItDown's `mammoth` converter emits *truncated*
   `![](data:image/png;base64...)` placeholders with no real bytes — the
   rewriter substitutes the real base64 pulled from `word/media/` in document
-  order so the resulting `data:` URIs actually display
+  order so the resulting `data:` URIs actually display at the right place
 - For PPTX / XLSX / EPUB (where MarkItDown drops images entirely), the
   rewriter pulls them straight from the source ZIP and appends an
-  **Embedded images** section
+  **Embedded images** section (no on-page coordinates available for these)
 - Runs as a post-processing step, so it composes with table detection and OCR
 
 ### Extract document images to files *(off by default)*
 - Works on **PDF, DOCX, PPTX, XLSX, EPUB** — not just PDFs
 - Writes each embedded image to an `images/` subfolder next to the output
   `.md` and links it with a relative path
+- **For PDFs, links are placed at the original on-page position** of each
+  image, interleaved with the surrounding text and tables. Requires
+  *Detect tables in PDFs* (auto-ticked when you enable this mode)
 - PDFs are rasterised to PNG via PyMuPDF; other formats preserve the original
   bytes and file extension (`.png`, `.jpg`, etc.) so nothing is re-encoded
 - For DOCX, every truncated `![](data:image/png;base64...)` placeholder
   MarkItDown emits is rewritten **in place** to point at the on-disk file —
   no broken `base64...` URIs are left in the output
-- Identical images are **deduped by SHA-256** of the bytes — a logo
-  referenced 50× in a Word document is written once
-- Filenames are prefixed with the `.md` stem (`<stem>_image<N>.png`,
-  `<stem>_p<page>_<xref>.png` for PDFs) so several documents can share one
-  `images/` folder without colliding
+- Identical images are deduped — by **PDF xref** (one PNG per unique image,
+  shared across every page reference) for PDFs, by **SHA-256 of the bytes**
+  for OOXML / EPUB (a logo referenced 50× becomes one file)
+- Filenames are prefixed with the `.md` stem so several documents can share
+  one `images/` folder without colliding (`<stem>_x<xref>.png` for PDFs,
+  `<stem>_image<N>.<ext>` for OOXML / EPUB)
 - Mutually exclusive with the base64 option — ticking one clears the other
 
 ### Scanned-PDF detection *(automatic)*
@@ -185,12 +191,18 @@ scan-vs-text status in the background; scanned ones get a **SCAN** badge.
 ### 3. Toggle options
 - *Overwrite existing .md files* — needed if you re-run a conversion.
 - *Mirror input folder structure in output* — preserves subdirectories.
-- *Detect tables in PDFs* — uses the table-aware converter.
-- *Embed document images as base64* — appends embedded images (PDF, DOCX,
-  PPTX, XLSX, EPUB) to the Markdown as real `data:` URIs (off by default).
+- *Detect tables in PDFs* — uses the table-aware converter. Auto-ticked
+  whenever an image mode is enabled, since inline image placement is
+  driven by the same converter.
+- *Embed document images as base64* — embeds images (PDF, DOCX, PPTX, XLSX,
+  EPUB) inline as real `data:` URIs. For PDFs the URI lands at the
+  image's original on-page position; other formats append (no coordinates
+  available). Off by default.
 - *Extract document images to files* — writes embedded images to an `images/`
-  subfolder, rewrites inline references to point at them, and dedupes by
-  content hash (off by default; mutually exclusive with base64).
+  subfolder and links them with relative paths. For PDFs the links land
+  inline at the original on-page position; other formats append. Dedupes
+  by PDF xref (PDFs) or SHA-256 (OOXML / EPUB). Off by default; mutually
+  exclusive with base64.
 - *Generate index.md for large files* — only fires for outputs > 500 lines.
 
 ### 4. OCR (optional)
@@ -342,7 +354,11 @@ the default `PdfConverter` for `.pdf` inputs) does this per page:
      exclusive per row (caused by header indentation)
    - Reject 1-column "tables" (bordered text boxes) and prose-heavy ones
 4. **Render the page in reading order** — text bands above, between, and
-   below tables.
+   below tables. When the converter is constructed with
+   `inline_images=True` (the worker sets this whenever an image mode is on),
+   image bboxes from PyMuPDF are treated as zero-height obstacles alongside
+   tables, so each image's `<!--MDGUI_IMG:x<xref>:w<w>:h<h>-->` placeholder
+   lands at its exact y-position between the surrounding text bands.
 5. **Promote heading lines** by font-size ratio against body:
    `≥ 1.8× → # heading`, `≥ 1.45× → ##`, `≥ 1.2× → ###`.
 6. **Filter heading noise** — < 3 alphabetic chars or contains `|` → skip.
@@ -370,15 +386,17 @@ after MarkItDown finishes. It branches by source format and by mode:
 
 | Source | What MarkItDown emits | What the extractor does |
 |---|---|---|
-| PDF | Text only; no images in `text_content` | Walks the PDF via PyMuPDF, dedupes images by `xref`, appends an **Embedded images** section grouped by page (base64 mode) or rasterises to PNG files (file mode). |
+| PDF *(with Detect tables on)* | `text_content` already contains `<!--MDGUI_IMG:...-->` placeholders emitted by `PdfPlumberTableConverter` at each image's on-page y-position | Replaces every placeholder with a real `![](data:...)` URI (embed mode) or `![](images/<stem>_x<xref>.png)` link (file mode). One file or base64 blob per unique `xref`; multiple page references share it. |
+| PDF *(Detect tables off — fallback)* | Text only | Walks the PDF via PyMuPDF, dedupes by `xref`, appends an **Embedded images** section grouped by page (base64) or rasterises to PNG files (file mode). |
 | DOCX | Text + **truncated** `![](data:image/png;base64...)` placeholders per image-reference | Reads `word/media/` from the ZIP, sorts by trailing image number, then rewrites each placeholder in document order — to the real base64 bytes (embed mode) or to an on-disk file path (file mode). |
-| PPTX / XLSX / EPUB | Text only; images dropped | Reads `ppt/media/`, `xl/media/`, or walks the EPUB ZIP by image extension. Appends an **Embedded images** section. |
+| PPTX / XLSX / EPUB | Text only; images dropped | Reads `ppt/media/`, `xl/media/`, or walks the EPUB ZIP by image extension. Appends an **Embedded images** section (no on-page coordinates available). |
 | Other (txt, html, csv…) | Text only | Logs `image extraction not supported for '<ext>' files` and exits cleanly. |
 
-In file mode, identical images (SHA-256 of the decoded bytes) share one
-file on disk — a logo referenced 50× becomes one PNG referenced 50×.
-Filenames are prefixed with the output `.md` stem so multiple documents can
-write into the same `images/` folder without collision.
+In file mode, identical images share one file on disk — by **PDF xref**
+for PDFs (a logo referenced 50× across every page becomes one PNG referenced
+50×) or by **SHA-256 of the decoded bytes** for OOXML / EPUB. Filenames are
+prefixed with the output `.md` stem so multiple documents can write into the
+same `images/` folder without collision.
 
 PyMuPDF (`fitz`) is only required for the PDF branch; the OOXML and EPUB
 branches use Python's stdlib `zipfile` and `hashlib` only.

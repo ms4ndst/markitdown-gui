@@ -62,7 +62,16 @@ class ConversionWorker(QObject):
         if self._detect_pdf_tables:
             from .pdf_table_converter import PdfPlumberTableConverter
 
-            md.register_converter(PdfPlumberTableConverter(), priority=-1.0)
+            # When the user wants images placed at their original position
+            # in the PDF, the converter emits a placeholder at every image's
+            # on-page y so the post-processor can swap each one for a real
+            # link / base64 URI. Without this flag the converter behaves as
+            # before and images would still drop to an appendix.
+            inline_images = self._embed_pdf_images or self._extract_pdf_images
+            md.register_converter(
+                PdfPlumberTableConverter(inline_images=inline_images),
+                priority=-1.0,
+            )
         return md
 
     def _build_ocr_markitdown(self) -> MarkItDown:
@@ -194,60 +203,102 @@ class ConversionWorker(QObject):
 
                 images_md = ""
                 if self._embed_pdf_images:
-                    # MarkItDown emits *truncated* `data:image/png;base64...`
-                    # placeholders for .docx — the URI has no real bytes.
-                    # Replace each placeholder with the actual base64 pulled
-                    # from the source document so the embedded images are
-                    # real, not literal "...".
-                    if "data:image/" in text_content:
-                        from .pdf_image_extractor import (
-                            rewrite_truncated_uris_to_base64,
-                        )
+                    # PDF path: PdfPlumberTableConverter (when inline_images
+                    # is on) has already dropped MDGUI_IMG placeholders at
+                    # each image's on-page position — swap them for real
+                    # base64 URIs so images sit where they appeared in the
+                    # source. Returns 0 placements for non-PDF or when the
+                    # table converter wasn't used; the legacy paths below
+                    # then take over.
+                    from .pdf_image_extractor import (
+                        replace_pdf_image_placeholders_with_base64,
+                    )
 
-                        text_content, _ = rewrite_truncated_uris_to_base64(
+                    text_content, placed = (
+                        replace_pdf_image_placeholders_with_base64(
                             text_content,
                             item.source,
                             log=self.log.emit,
                         )
-                    else:
-                        # Formats markitdown doesn't inline at all (PDF,
-                        # most PPTX, all XLSX/EPUB) — extract from source.
-                        from .pdf_image_extractor import (
-                            extract_document_images_markdown,
-                        )
+                    )
+                    if placed == 0:
+                        # MarkItDown emits *truncated* `data:image/png;base64...`
+                        # placeholders for .docx — the URI has no real bytes.
+                        # Replace each placeholder with the actual base64
+                        # pulled from the source document so the embedded
+                        # images are real, not literal "...".
+                        if "data:image/" in text_content:
+                            from .pdf_image_extractor import (
+                                rewrite_truncated_uris_to_base64,
+                            )
 
-                        images_md = extract_document_images_markdown(
-                            item.source, log=self.log.emit
-                        )
+                            text_content, _ = (
+                                rewrite_truncated_uris_to_base64(
+                                    text_content,
+                                    item.source,
+                                    log=self.log.emit,
+                                )
+                            )
+                        else:
+                            # Formats markitdown doesn't inline at all (PDF,
+                            # most PPTX, all XLSX/EPUB) — extract from source.
+                            from .pdf_image_extractor import (
+                                extract_document_images_markdown,
+                            )
+
+                            images_md = extract_document_images_markdown(
+                                item.source, log=self.log.emit
+                            )
                 elif self._extract_pdf_images:
-                    # Rewrite every inline image (full base64 OR truncated
-                    # placeholder) to a relative file link, writing the
-                    # bytes to <md_dir>/images/. Handles .docx (truncated
-                    # placeholders, bytes pulled from word/media) and any
-                    # converter that emits real base64.
+                    # PDF path: same placeholder swap as embed mode, but
+                    # writing PNGs to <md_dir>/images/ and emitting relative
+                    # links. One file per unique xref; duplicate references
+                    # across pages share it.
                     from .pdf_image_extractor import (
-                        rewrite_inline_images_to_files,
+                        replace_pdf_image_placeholders_with_files,
                     )
 
-                    text_content, rewritten = rewrite_inline_images_to_files(
-                        text_content,
-                        item.source,
-                        item.destination,
-                        log=self.log.emit,
-                    )
-                    # If nothing was inline (PDF, most PPTX, XLSX, EPUB),
-                    # fall back to pulling images out of the source file
-                    # directly and appending the section at the end.
-                    if rewritten == 0:
-                        from .pdf_image_extractor import (
-                            extract_document_images_to_files,
-                        )
-
-                        images_md = extract_document_images_to_files(
+                    text_content, placed = (
+                        replace_pdf_image_placeholders_with_files(
+                            text_content,
                             item.source,
                             item.destination,
                             log=self.log.emit,
                         )
+                    )
+                    if placed == 0:
+                        # Rewrite every inline image (full base64 OR
+                        # truncated placeholder) to a relative file link,
+                        # writing the bytes to <md_dir>/images/. Handles
+                        # .docx (truncated placeholders, bytes pulled from
+                        # word/media) and any converter that emits real
+                        # base64.
+                        from .pdf_image_extractor import (
+                            rewrite_inline_images_to_files,
+                        )
+
+                        text_content, rewritten = (
+                            rewrite_inline_images_to_files(
+                                text_content,
+                                item.source,
+                                item.destination,
+                                log=self.log.emit,
+                            )
+                        )
+                        # If nothing was inline (PDF without table
+                        # detection, most PPTX, XLSX, EPUB), fall back to
+                        # pulling images out of the source file directly
+                        # and appending the section at the end.
+                        if rewritten == 0:
+                            from .pdf_image_extractor import (
+                                extract_document_images_to_files,
+                            )
+
+                            images_md = extract_document_images_to_files(
+                                item.source,
+                                item.destination,
+                                log=self.log.emit,
+                            )
                 if images_md:
                     text_content = (
                         text_content.rstrip() + "\n\n" + images_md + "\n"

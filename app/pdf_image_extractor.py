@@ -562,6 +562,255 @@ def rewrite_inline_images_to_files(
     return new_md, state["unique"]
 
 
+# === Inline placement via placeholders ============================
+# A PDF's text converter throws away on-page coordinates by the time the
+# post-processor sees the markdown, so we can't place images at their
+# original positions in post-processing alone. Instead, ``PdfPlumberTableConverter``
+# (when ``inline_images=True``) emits a comment-style placeholder at every
+# image's y-position on its page, and the two functions below swap each
+# placeholder for either a relative file link (extract mode) or a base64
+# data URI (embed mode). One file (or one base64 blob) is written per
+# unique xref; duplicate occurrences across pages share it.
+
+_PDF_IMAGE_PLACEHOLDER_FMT = "<!--MDGUI_IMG:x{xref}:w{width}:h{height}-->"
+_PDF_IMAGE_PLACEHOLDER_RE = re.compile(
+    r"<!--MDGUI_IMG:x(\d+):w(\d+):h(\d+)-->"
+)
+
+
+def format_pdf_image_placeholder(xref: int, width: int, height: int) -> str:
+    """Build the comment placeholder ``PdfPlumberTableConverter`` emits."""
+    return _PDF_IMAGE_PLACEHOLDER_FMT.format(
+        xref=xref, width=width, height=height,
+    )
+
+
+def iter_pdf_image_markers(
+    pdf_bytes: bytes,
+    *,
+    min_dimension: int = MIN_DIMENSION,
+) -> dict[int, list[tuple[float, str]]]:
+    """Map ``page_index -> [(y_top, placeholder), ...]`` for every embedded
+    image whose dimensions clear ``min_dimension``.
+
+    The same xref reappearing on several pages produces several entries —
+    one per placement — so each gets rendered at its actual location.
+    """
+    if fitz is None:
+        return {}
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:  # noqa: BLE001 - any open failure means no markers
+        return {}
+
+    markers: dict[int, list[tuple[float, str]]] = {}
+    try:
+        for page_index in range(doc.page_count):
+            page = doc[page_index]
+            try:
+                infos = page.get_image_info(xrefs=True)
+            except Exception:  # noqa: BLE001 - skip a problem page
+                continue
+            for info in infos:
+                xref = int(info.get("xref", 0) or 0)
+                if xref == 0:
+                    continue
+                bbox = info.get("bbox")
+                if not bbox or len(bbox) < 4:
+                    continue
+                width = int(info.get("width", 0) or 0)
+                height = int(info.get("height", 0) or 0)
+                if width < min_dimension or height < min_dimension:
+                    continue
+                placeholder = format_pdf_image_placeholder(
+                    xref, width, height,
+                )
+                markers.setdefault(page_index, []).append(
+                    (float(bbox[1]), placeholder)
+                )
+    finally:
+        doc.close()
+    return markers
+
+
+def _replace_pdf_image_placeholders(
+    markdown: str,
+    pdf_path: str | Path,
+    *,
+    render: Callable[[int, int, int], str | None],
+    log: Callable[[str], None] | None,
+    success_message: Callable[[int], str] | None = None,
+) -> tuple[str, int]:
+    """Shared core: scan ``markdown`` for ``<!--MDGUI_IMG:...-->`` placeholders
+    and substitute the rendered link, base64, or empty string for each.
+
+    ``render(xref, width, height)`` returns the replacement string, or
+    ``None`` to drop the placeholder (e.g., the image couldn't be saved).
+    """
+    if not _PDF_IMAGE_PLACEHOLDER_RE.search(markdown):
+        return markdown, 0
+
+    references = 0
+
+    def _sub(match: re.Match[str]) -> str:
+        nonlocal references
+        xref = int(match.group(1))
+        width = int(match.group(2))
+        height = int(match.group(3))
+        rendered = render(xref, width, height)
+        if rendered is None:
+            return ""
+        references += 1
+        return rendered
+
+    new_md = _PDF_IMAGE_PLACEHOLDER_RE.sub(_sub, markdown)
+    if references and log is not None and success_message is not None:
+        log(success_message(references))
+    return new_md, references
+
+
+def replace_pdf_image_placeholders_with_files(
+    markdown: str,
+    pdf_path: str | Path,
+    output_md_path: str | Path,
+    *,
+    subfolder: str = DEFAULT_IMAGE_SUBFOLDER,
+    log: Callable[[str], None] | None = None,
+) -> tuple[str, int]:
+    """Replace every ``<!--MDGUI_IMG:...-->`` placeholder with a relative
+    Markdown link to a PNG written under ``<md_dir>/<subfolder>/``.
+
+    One PNG per unique xref — a logo placeholder repeated on every page
+    shares one file. Returns ``(new_markdown, references_replaced)``.
+    """
+    if not _PDF_IMAGE_PLACEHOLDER_RE.search(markdown):
+        return markdown, 0
+    if fitz is None:
+        # Strip the placeholders rather than leaving HTML comments visible
+        # in the output. The user already saw a "PyMuPDF missing" warning
+        # when the markers were generated.
+        return _PDF_IMAGE_PLACEHOLDER_RE.sub("", markdown), 0
+    doc = _open(pdf_path, log)
+    if doc is None:
+        return _PDF_IMAGE_PLACEHOLDER_RE.sub("", markdown), 0
+
+    md_path = Path(output_md_path)
+    image_dir = md_path.parent / subfolder
+    name_prefix = _safe_stem(md_path.stem)
+
+    # xref -> saved filename, or None if extraction failed.
+    saved: dict[int, str | None] = {}
+
+    def _ensure_saved(xref: int) -> str | None:
+        if xref in saved:
+            return saved[xref]
+        try:
+            pix = fitz.Pixmap(doc, xref)
+        except Exception:  # noqa: BLE001 - skip an unreadable image
+            saved[xref] = None
+            return None
+        try:
+            if pix.n - pix.alpha >= 4:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            filename = f"{name_prefix}_x{xref}.png"
+            try:
+                image_dir.mkdir(parents=True, exist_ok=True)
+                pix.save(str(image_dir / filename))
+            except Exception as exc:  # noqa: BLE001 - report and skip
+                if log is not None:
+                    log(f"  ! Could not write {filename}: {exc}")
+                saved[xref] = None
+                return None
+        finally:
+            pix = None  # release the pixmap's buffer promptly
+        saved[xref] = filename
+        return filename
+
+    def _render(xref: int, width: int, height: int) -> str | None:
+        filename = _ensure_saved(xref)
+        if filename is None:
+            return None
+        alt = f"Image {xref} ({width}x{height})"
+        return f"![{alt}]({subfolder}/{filename})"
+
+    try:
+        new_md, references = _replace_pdf_image_placeholders(
+            markdown,
+            pdf_path,
+            render=_render,
+            log=log,
+            success_message=lambda n: (
+                f"  -> placed {n} image reference(s) inline, "
+                f"{sum(1 for v in saved.values() if v is not None)} "
+                f"unique file(s) written to {subfolder}/"
+            ),
+        )
+    finally:
+        doc.close()
+    return new_md, references
+
+
+def replace_pdf_image_placeholders_with_base64(
+    markdown: str,
+    pdf_path: str | Path,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> tuple[str, int]:
+    """Replace every ``<!--MDGUI_IMG:...-->`` placeholder with an inline
+    ``data:image/...;base64,...`` URI carrying the actual image bytes.
+
+    One decode per unique xref, cached and reused. Returns
+    ``(new_markdown, references_replaced)``.
+    """
+    if not _PDF_IMAGE_PLACEHOLDER_RE.search(markdown):
+        return markdown, 0
+    if fitz is None:
+        return _PDF_IMAGE_PLACEHOLDER_RE.sub("", markdown), 0
+    doc = _open(pdf_path, log)
+    if doc is None:
+        return _PDF_IMAGE_PLACEHOLDER_RE.sub("", markdown), 0
+
+    cache: dict[int, tuple[str, str] | None] = {}
+
+    def _ensure(xref: int) -> tuple[str, str] | None:
+        if xref in cache:
+            return cache[xref]
+        try:
+            info = doc.extract_image(xref)
+        except Exception:  # noqa: BLE001 - skip unreadable image
+            cache[xref] = None
+            return None
+        if not info or not info.get("image"):
+            cache[xref] = None
+            return None
+        ext = info.get("ext") or "png"
+        b64 = base64.b64encode(info["image"]).decode("ascii")
+        cache[xref] = (ext, b64)
+        return cache[xref]
+
+    def _render(xref: int, width: int, height: int) -> str | None:
+        result = _ensure(xref)
+        if result is None:
+            return None
+        ext, b64 = result
+        alt = f"Image {xref} ({width}x{height})"
+        return f"![{alt}](data:image/{ext};base64,{b64})"
+
+    try:
+        new_md, references = _replace_pdf_image_placeholders(
+            markdown,
+            pdf_path,
+            render=_render,
+            log=log,
+            success_message=lambda n: (
+                f"  -> embedded {n} image reference(s) inline as base64"
+            ),
+        )
+    finally:
+        doc.close()
+    return new_md, references
+
+
 def rewrite_truncated_uris_to_base64(
     markdown: str,
     src_path: str | Path,

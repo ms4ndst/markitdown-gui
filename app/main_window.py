@@ -728,12 +728,21 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{preset.name}: {preset.hint}", 15000)
 
     def _on_embed_images_toggled(self, on: bool) -> None:
-        if on and self.extract_images_check.isChecked():
-            self.extract_images_check.setChecked(False)
+        if on:
+            if self.extract_images_check.isChecked():
+                self.extract_images_check.setChecked(False)
+            # Inline image placement needs the page-aware
+            # PdfPlumberTableConverter; auto-tick "Detect tables in PDFs"
+            # so the user doesn't have to remember the dependency.
+            if not self.detect_tables_check.isChecked():
+                self.detect_tables_check.setChecked(True)
 
     def _on_extract_images_toggled(self, on: bool) -> None:
-        if on and self.embed_images_check.isChecked():
-            self.embed_images_check.setChecked(False)
+        if on:
+            if self.embed_images_check.isChecked():
+                self.embed_images_check.setChecked(False)
+            if not self.detect_tables_check.isChecked():
+                self.detect_tables_check.setChecked(True)
 
     def _on_ocr_toggled(self, enabled: bool) -> None:
         for w in getattr(self, "_ocr_field_widgets", []):
