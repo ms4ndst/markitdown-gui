@@ -20,9 +20,12 @@ keep them.
 
 In addition to the empty-heading pass, this module exposes ``apply_lint_fixes``
 — a batch of safe auto-fixes for the markdownlint rules whose violations have
-a single mechanical correction (MD009/MD010/MD012/MD018/MD022/MD026/MD029/
-MD031/MD032/MD034/MD047). Rules that require human judgment (MD011, MD024,
-MD025, MD033, MD041, MD042, MD045) are left for the downstream linter.
+a single mechanical correction (MD009/MD010/MD012/MD018/MD022/MD025/MD026/
+MD029/MD031/MD032/MD034/MD047). MD025 is fixed only when YAML frontmatter
+declares a ``title:`` (the demotion is then unambiguous — the doc said its
+own title in metadata, the body shouldn't repeat it as H1). Rules that
+require human judgment (MD011, MD024, MD033, MD041, MD042, MD045) are left
+for the downstream linter.
 """
 
 from __future__ import annotations
@@ -128,10 +131,18 @@ _HASH_NO_SPACE_RE = re.compile(r"^(?P<indent>\s*)(?P<hashes>#{1,6})(?P<rest>[^# 
 _TRAILING_PUNCT_RE = re.compile(r"[.,;:!]+$")
 _ORDERED_ITEM_RE = re.compile(r"^(?P<indent>\s*)(?P<num>\d+)(?P<delim>[.)])(?P<after>\s+)(?P<text>.*)$")
 _LIST_ITEM_RE = re.compile(r"^(?P<indent>\s*)(?:[-*+]|\d+[.)])\s+")
-# Bare http(s) URL preceded by start-of-string, whitespace, or a non-link char.
-# Excludes URLs already inside (), <>, [], or ``. Stops at common terminators.
+# Bare http(s) URL.
+#
+# Lead accepts: start-of-line, whitespace/NBSP, OR an opening paren that
+# is NOT preceded by `]`. The `]` guard preserves real inline links
+# `[text](url)` — we must not wrap a URL inside an established link's
+# parens — while still wrapping a paren-introduced URL like
+# `(https://...)` on its own (a common PDF-extraction artefact).
+#
+# Stops at the first whitespace, `<`, `>`, `)`, `]`, or backtick — so
+# URLs already inside `<...>` / `[...]` / `` `...` `` are never matched.
 _BARE_URL_RE = re.compile(
-    r"(?P<lead>(?:^|[\s ]))(?P<url>https?://[^\s<>)\]`]+?)(?P<trail>[.,;:!?]?(?=$|[\s ]))",
+    r"(?P<lead>(?:^|[\s ]|(?<!\])\())(?P<url>https?://[^\s<>)\]`]+?)(?P<trail>[.,;:!?]?(?=$|[\s )]))",
     re.MULTILINE,
 )
 # Heading punctuation we strip per markdownlint MD026 default set, minus '?'
@@ -296,15 +307,58 @@ def fix_bare_urls(text: str) -> tuple[str, int]:
     return "\n".join(lines), count
 
 
-def fix_ordered_list_prefix(text: str) -> tuple[str, int]:
-    """MD029: renumber ordered list items to be sequential 1, 2, 3, ... per list.
+def _detect_ol_style(lines: list[str], fence: set[int]) -> str:
+    """Mirror markdownlint's MD029 style auto-detect: the first ordered list
+    that has at least two items at the same indent + delimiter decides the
+    style. ``'one'`` when both items are numbered 1, ``'ordered'`` otherwise.
 
-    A list ends when we hit a non-list, non-blank, non-continuation line. Nested
-    sub-lists are not specially handled — they're renumbered as part of whatever
-    flat sequence they appear in, which matches markdownlint's per-level view.
+    Falls back to ``'ordered'`` when no list has two items (single-item lists
+    don't constrain the style either way, so the choice is moot).
+    """
+    first_indent: str | None = None
+    first_delim: str | None = None
+    first_num: int | None = None
+    for i, line in enumerate(lines):
+        if i in fence:
+            continue
+        m = _ORDERED_ITEM_RE.match(line)
+        if not m:
+            continue
+        if first_num is None:
+            first_indent = m.group("indent")
+            first_delim = m.group("delim")
+            first_num = int(m.group("num"))
+            continue
+        if m.group("indent") == first_indent and m.group("delim") == first_delim:
+            second_num = int(m.group("num"))
+            if first_num == 1 and second_num == 1:
+                return "one"
+            return "ordered"
+        # Different list — reset to use this list's first item for comparison.
+        first_indent = m.group("indent")
+        first_delim = m.group("delim")
+        first_num = int(m.group("num"))
+    return "ordered"
+
+
+def fix_ordered_list_prefix(text: str) -> tuple[str, int]:
+    """MD029: renumber ordered list items to match the document's detected
+    style.
+
+    Markdownlint locks one style for the whole document based on the first
+    list it sees (either ``1, 2, 3, ...`` or ``1, 1, 1, ...``). We mirror
+    that lock so our renumbering doesn't fight the linter — if the doc starts
+    with ``1, 1`` we force every list to all-ones; if it starts with ``1, 2``
+    we renumber sequentially.
+
+    A list ends when we hit a non-list, non-blank, non-continuation line.
+    Nested sub-lists are not specially handled — they're renumbered as part
+    of whatever flat sequence they appear in, which matches markdownlint's
+    per-level view.
     """
     lines = text.split("\n")
     fence = _compute_skip_lines(lines)
+    style = _detect_ol_style(lines, fence)
     count = 0
     i = 0
     while i < len(lines):
@@ -329,7 +383,9 @@ def fix_ordered_list_prefix(text: str) -> tuple[str, int]:
                     after = mi.group("after")
                     lines[i] = f"{indent}{expected}{delim}{after}{mi.group('text')}"
                     count += 1
-                expected += 1
+                # one-style: every item stays at 1. ordered-style: bump.
+                if style == "ordered":
+                    expected += 1
                 i += 1
                 continue
             # Continuation: deeper indent or blank line inside the list.
@@ -474,6 +530,80 @@ def fix_consecutive_blanks(text: str) -> tuple[str, int]:
     return "\n".join(out), count
 
 
+# A line whose entire content is `N)` for N = 1..999 (with optional leading
+# whitespace). In PDF-extracted markdown these are almost always footnote-
+# style callouts referencing markers `1)`, `2)`, ... inside a preceding
+# table column, NOT real ordered list items. Markdownlint nevertheless
+# treats them as a list, which then fights its MD029 style lock.
+_BARE_CALLOUT_RE = re.compile(r"^(?P<indent>\s*)(?P<num>\d{1,3})\)\s*$")
+
+
+def fix_bare_numeric_callouts(text: str) -> tuple[str, int]:
+    """Escape the `)` on lines that are *only* ``N)`` so they stop registering
+    as ordered list items.
+
+    ``1)`` becomes ``1\\)`` — visually identical in every CommonMark renderer
+    (the backslash escapes the close paren) but no longer parsed as a list
+    marker, so MD029 / MD032 stop firing on it.
+
+    Lines inside fenced code blocks are left alone. Real ordered list items
+    (those with body content after the marker) are unaffected — only the
+    bare ``N)``-on-its-own pattern is matched.
+    """
+    lines = text.split("\n")
+    fence = _compute_fence_lines(lines)
+    count = 0
+    for i, line in enumerate(lines):
+        if i in fence:
+            continue
+        m = _BARE_CALLOUT_RE.match(line)
+        if not m:
+            continue
+        lines[i] = f"{m.group('indent')}{m.group('num')}\\)"
+        count += 1
+    return "\n".join(lines), count
+
+
+_FRONTMATTER_TITLE_RE = re.compile(r"^\s*title\s*:\s*\S", re.IGNORECASE)
+
+
+def fix_md025_with_frontmatter(text: str) -> tuple[str, int]:
+    """MD025: when YAML frontmatter contains a ``title:`` field, demote the
+    first body H1 to H2.
+
+    Markdownlint's default config treats the frontmatter ``title:`` value as
+    the document's H1 — so any ``# Heading`` in the body becomes a second
+    top-level heading and fails MD025. The fix is unambiguous: the doc has
+    declared its title in metadata, so the body shouldn't repeat it at the
+    same level.
+
+    Only the *first* body H1 is touched (any subsequent H1s are left for the
+    linter to flag — they're more likely a real authoring error than a PDF
+    artefact).
+    """
+    lines = text.split("\n")
+    fm_end = _compute_frontmatter_end(lines)
+    if fm_end == 0:
+        return text, 0
+    has_title = any(_FRONTMATTER_TITLE_RE.match(lines[i]) for i in range(fm_end))
+    if not has_title:
+        return text, 0
+    fence = _compute_fence_lines(lines)
+    for i in range(fm_end, len(lines)):
+        if i in fence:
+            continue
+        line = lines[i]
+        # Match a level-1 heading only — ``# X`` but not ``## X``.
+        stripped = line.lstrip()
+        if not stripped.startswith("# ") and stripped != "#":
+            continue
+        # Demote to H2.
+        leading_ws_len = len(line) - len(stripped)
+        lines[i] = line[:leading_ws_len] + "#" + line[leading_ws_len:]
+        return "\n".join(lines), 1
+    return text, 0
+
+
 def fix_trailing_newline(text: str) -> tuple[str, int]:
     """MD047: file ends with exactly one newline."""
     if text == "":
@@ -491,10 +621,12 @@ def fix_trailing_newline(text: str) -> tuple[str, int]:
 #   5. MD047 last so the trailing newline survives all transformations.
 _FIX_PIPELINE: tuple[tuple[str, "callable[[str], tuple[str, int]]"], ...] = (  # type: ignore[name-defined]
     ("MD010", fix_hard_tabs),
+    ("MD025", fix_md025_with_frontmatter),
     ("MD009", fix_trailing_whitespace),
     ("MD018", fix_missing_hash_space),
     ("MD026", fix_heading_trailing_punctuation),
     ("MD034", fix_bare_urls),
+    ("CALLOUT", fix_bare_numeric_callouts),
     ("MD029", fix_ordered_list_prefix),
     ("MD022", fix_blanks_around_headings),
     ("MD031", fix_blanks_around_fenced_code),
