@@ -1,5 +1,9 @@
 PySide6>=6.10
-markitdown[all]
+# Curated MarkItDown extras — every format the GUI surfaces, minus the
+# YouTube transcript extra (whose `youtube-transcript-api~=1.0.0` pin
+# blocks resolution on Python 3.14) and the unused Azure SDKs. Drop or
+# add extras to match what you need.
+markitdown[pdf,docx,xlsx,xls,pptx,outlook,audio-transcription]
 # Optional: enable the "OCR images in PDFs" feature in the GUI.
 # Requires an OpenAI-compatible LLM endpoint (OpenAI, Azure OpenAI, LM Studio, etc.)
 markitdown-ocr

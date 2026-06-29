@@ -351,6 +351,16 @@ class MainWindow(QMainWindow):
         self.embed_images_check.toggled.connect(self._on_embed_images_toggled)
         self.extract_images_check.toggled.connect(self._on_extract_images_toggled)
 
+        self.strip_pagenumbers_check = QCheckBox("Strip page numbers in PDFs")
+        self.strip_pagenumbers_check.setChecked(False)
+        self.strip_pagenumbers_check.setToolTip(
+            "Remove standalone page-number lines (e.g. '5', '- 5 -',\n"
+            "'Page 5', 'Page 5 of 20', '5/20') that PDF text extraction\n"
+            "often leaves as their own paragraphs. Only lines isolated by\n"
+            "blank lines above and below are removed, so numbers inside\n"
+            "paragraphs, tables and list items are left alone."
+        )
+
         general_row = QHBoxLayout()
         general_row.addWidget(self.overwrite_check)
         general_row.addSpacing(20)
@@ -366,6 +376,8 @@ class MainWindow(QMainWindow):
         pdf_row.addWidget(self.embed_images_check)
         pdf_row.addSpacing(20)
         pdf_row.addWidget(self.extract_images_check)
+        pdf_row.addSpacing(20)
+        pdf_row.addWidget(self.strip_pagenumbers_check)
         pdf_row.addStretch(1)
         body_layout.addLayout(pdf_row)
 
@@ -467,7 +479,7 @@ class MainWindow(QMainWindow):
         for cb in (self.overwrite_check, self.mirror_check,
                    self.detect_tables_check, self.generate_index_check,
                    self.embed_images_check, self.extract_images_check,
-                   self.ocr_check):
+                   self.strip_pagenumbers_check, self.ocr_check):
             cb.toggled.connect(self._schedule_save)
         self.ocr_provider_combo.currentIndexChanged.connect(self._schedule_save)
         self.ocr_model_combo.currentTextChanged.connect(self._schedule_save)
@@ -489,6 +501,7 @@ class MainWindow(QMainWindow):
             "generate_index": self.generate_index_check.isChecked(),
             "embed_images": self.embed_images_check.isChecked(),
             "extract_images": self.extract_images_check.isChecked(),
+            "strip_pagenumbers": self.strip_pagenumbers_check.isChecked(),
             "theme": {
                 "flavor": flavor_data.value if isinstance(flavor_data, Flavor) else "mocha",
                 "accent": accent_data if isinstance(accent_data, str) else "mauve",
@@ -518,6 +531,7 @@ class MainWindow(QMainWindow):
             ("generate_index", self.generate_index_check),
             ("embed_images", self.embed_images_check),
             ("extract_images", self.extract_images_check),
+            ("strip_pagenumbers", self.strip_pagenumbers_check),
         ):
             if key in cfg:
                 widget.setChecked(bool(cfg[key]))
@@ -1156,6 +1170,7 @@ class MainWindow(QMainWindow):
             generate_index=self.generate_index_check.isChecked(),
             embed_pdf_images=self.embed_images_check.isChecked(),
             extract_pdf_images=self.extract_images_check.isChecked(),
+            strip_pdf_page_numbers=self.strip_pagenumbers_check.isChecked(),
             ocr=OcrConfig(
                 enabled=self.ocr_check.isChecked(),
                 model=self.ocr_model_combo.currentText().strip() or "gpt-4o",

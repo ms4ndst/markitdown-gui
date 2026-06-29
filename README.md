@@ -140,28 +140,46 @@ git clone <this-repo>
 cd markitdown_gui
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install .
 ```
 
-`markitdown[all]` pulls every optional dependency (PDF, DOCX, XLSX, PPTX,
-audio, EPUB, …). To slim down, edit `requirements.txt` and replace it with
-e.g. `markitdown[pdf,docx,xlsx]`.
+This installs a `markitdown-gui` command on your PATH (a `pythonw.exe`-based
+launcher on Windows, so no console window appears behind the Qt UI).
 
-`markitdown-ocr` and `openai` are only needed for the OCR feature; the rest
-of the app runs fine without them.
+For development, use an editable install so source edits take effect
+without re-running pip:
+
+```powershell
+pip install -e .
+```
+
+The dependency list (declared in [`pyproject.toml`](pyproject.toml)) pulls
+`PySide6`, a curated set of MarkItDown extras
+(`markitdown[pdf,docx,xlsx,xls,pptx,outlook,audio-transcription]`),
+`markitdown-ocr`, and `openai`. `markitdown[all]` is **deliberately
+avoided** — it pins `youtube-transcript-api~=1.0.0`, every 1.0.x release
+of which declares `Requires-Python <3.14`, so `[all]` cannot resolve on
+Python 3.14. The curated set covers every format the GUI actually
+surfaces (PDF, DOCX, XLSX/XLS, PPTX, .msg, audio); EPUB / HTML / CSV
+need no extra. `markitdown-ocr` and `openai` are only used by the OCR
+feature; the rest of the app runs fine without them — use
+`pip install --no-deps .` and curate manually if you want a leaner
+footprint.
 
 ---
 
 ## Run
 
 ```powershell
-python -m app.main
+markitdown-gui
 ```
 
-The vendored MarkItDown source lives under [`markitdown/`](markitdown/). The
-`requirements.txt` installs the public PyPI package by default, which is
-sufficient for the GUI. To run against the vendored copy instead (e.g. while
-modifying it), install both packages editable:
+(or `python -m app.main` if you'd rather not rely on the entry point.)
+
+The vendored MarkItDown source lives under [`markitdown/`](markitdown/).
+`pip install .` pulls the public PyPI packages by default, which is
+sufficient for the GUI. To run against the vendored copy instead (e.g.
+while modifying it), install both packages editable:
 
 ```powershell
 pip install -e markitdown\packages\markitdown
@@ -317,7 +335,7 @@ The file is human-editable. Delete it any time to start clean.
 
 ```
 app/
-  main.py                 # QApplication entry point (`python -m app.main`)
+  main.py                 # QApplication entry point (`markitdown-gui` / `python -m app.main`)
   main_window.py          # MainWindow + FileListDelegate (SCAN badge)
   worker.py               # ConversionWorker (QThread), OcrConfig, per-file routing
   pdf_table_converter.py  # PdfPlumberTableConverter — tables + font-size headings
@@ -334,7 +352,8 @@ markitdown/               # Vendored upstream MarkItDown source (see Credits)
     markitdown-ocr/       # LLM-vision OCR plugin (with local patches)
   LICENSE                 # Upstream MIT license (preserved)
   README.md               # Upstream documentation (preserved)
-requirements.txt
+pyproject.toml            # Build metadata + dependencies + `markitdown-gui` entry point
+requirements.txt          # Legacy install path; pyproject.toml is the source of truth
 README.md                 # This file
 ```
 
@@ -504,7 +523,7 @@ config persistence are original code written for this project.
 
 ## License
 
-The GUI code in this repository (`app/`, `requirements.txt`, this README)
+The GUI code in this repository (`app/`, `pyproject.toml`, this README)
 is MIT-licensed. The vendored MarkItDown source remains under its own MIT
 license — see [`markitdown/LICENSE`](markitdown/LICENSE).
 

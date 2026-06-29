@@ -41,6 +41,7 @@ class ConversionWorker(QObject):
         generate_index: bool = False,
         embed_pdf_images: bool = False,
         extract_pdf_images: bool = False,
+        strip_pdf_page_numbers: bool = False,
         ocr: OcrConfig | None = None,
     ) -> None:
         super().__init__()
@@ -50,6 +51,7 @@ class ConversionWorker(QObject):
         self._generate_index = generate_index
         self._embed_pdf_images = embed_pdf_images
         self._extract_pdf_images = extract_pdf_images
+        self._strip_pdf_page_numbers = strip_pdf_page_numbers
         self._ocr = ocr or OcrConfig()
         self._cancelled = False
 
@@ -307,7 +309,11 @@ class ConversionWorker(QObject):
                 # Strip empty / image-only headings that mammoth leaves
                 # behind in DOCX output — they lint as MD042 in any
                 # markdown linter and break tables of contents.
-                from .markdown_cleanup import strip_empty_headings
+                from .markdown_cleanup import (
+                    apply_lint_fixes,
+                    strip_empty_headings,
+                    strip_page_numbers,
+                )
 
                 text_content, removed_headings = strip_empty_headings(
                     text_content
@@ -317,6 +323,33 @@ class ConversionWorker(QObject):
                         f"  -> cleaned up {removed_headings} empty / "
                         "image-only heading(s)"
                     )
+
+                # Page-number strip is opt-in and PDF-only — other formats
+                # rarely carry raw page numbers as their own paragraphs and
+                # we'd risk eating standalone numeric content.
+                if (
+                    self._strip_pdf_page_numbers
+                    and item.source.suffix.lower() == ".pdf"
+                ):
+                    text_content, removed_pages = strip_page_numbers(
+                        text_content
+                    )
+                    if removed_pages:
+                        self.log.emit(
+                            f"  -> stripped {removed_pages} page-number line(s)"
+                        )
+
+                # Run the markdownlint auto-fix pass over the safely-fixable
+                # rules (MD009/MD010/MD012/MD018/MD022/MD026/MD029/MD031/
+                # MD032/MD034/MD047). Anything that needs human judgment
+                # (MD025/MD041/MD042/MD045 etc.) is left for the downstream
+                # linter to flag.
+                text_content, lint_fixes = apply_lint_fixes(text_content)
+                if lint_fixes:
+                    summary = ", ".join(
+                        f"{rule}:{n}" for rule, n in sorted(lint_fixes.items())
+                    )
+                    self.log.emit(f"  -> markdownlint auto-fixed {summary}")
 
                 item.destination.parent.mkdir(parents=True, exist_ok=True)
                 item.destination.write_text(text_content, encoding="utf-8")

@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "markitdown-gui"
+description = "Catppuccin-themed Windows GUI for batch-converting documents to Markdown via Microsoft MarkItDown."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Magnus Sandström" }]
+keywords = ["markdown", "markitdown", "pdf", "docx", "ocr", "gui", "catppuccin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dynamic = ["version"]
+dependencies = [
+    "PySide6>=6.10",
+    # Curated MarkItDown extras — every format the GUI actually surfaces,
+    # minus the ones with Python-version-blocking pins or unused cloud SDKs:
+    #   - `youtube-transcription` (and therefore `[all]`) pins
+    #     `youtube-transcript-api~=1.0.0`, and every 1.0.x release declares
+    #     `Requires-Python <3.14`, so `[all]` cannot resolve on Python 3.14.
+    #   - `az-doc-intel` / `az-content-understanding` aren't surfaced in the
+    #     UI; skipping them keeps the install footprint small.
+    "markitdown[pdf,docx,xlsx,xls,pptx,outlook,audio-transcription]",
+    # OCR support is technically optional (the rest of the app runs fine
+    # without it) but bundled by default so `pip install .` matches the
+    # historical requirements.txt behaviour. Use `pip install --no-deps`
+    # and curate manually if you want a slimmer install.
+    "markitdown-ocr",
+    "openai",
+]
+
+# gui-scripts (not scripts) so Windows installs a `pythonw.exe`-based
+# launcher: double-clicking or running `markitdown-gui` does NOT spawn a
+# console window behind the Qt UI. Treated the same as [project.scripts]
+# on macOS / Linux.
+[project.gui-scripts]
+markitdown-gui = "app.main:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "app.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["markitdown*", "node_modules*", "tests*"]
