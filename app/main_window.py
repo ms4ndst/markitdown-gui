@@ -361,6 +361,20 @@ class MainWindow(QMainWindow):
             "paragraphs, tables and list items are left alone."
         )
 
+        self.strip_headers_footers_check = QCheckBox(
+            "Strip headers/footers in PDFs"
+        )
+        self.strip_headers_footers_check.setChecked(False)
+        self.strip_headers_footers_check.setToolTip(
+            "Remove running headers and footers — lines that repeat across\n"
+            "pages, such as a signature banner or document title bar that\n"
+            "PDF text extraction re-emits inline on every page. A line is\n"
+            "removed only when it recurs 3+ times and is not a heading or\n"
+            "list item, so unique body text is never touched. Headers/footers\n"
+            "on documents with fewer than 3 pages stay (too few repeats to\n"
+            "tell them apart from real content)."
+        )
+
         general_row = QHBoxLayout()
         general_row.addWidget(self.overwrite_check)
         general_row.addSpacing(20)
@@ -378,6 +392,8 @@ class MainWindow(QMainWindow):
         pdf_row.addWidget(self.extract_images_check)
         pdf_row.addSpacing(20)
         pdf_row.addWidget(self.strip_pagenumbers_check)
+        pdf_row.addSpacing(20)
+        pdf_row.addWidget(self.strip_headers_footers_check)
         pdf_row.addStretch(1)
         body_layout.addLayout(pdf_row)
 
@@ -479,7 +495,8 @@ class MainWindow(QMainWindow):
         for cb in (self.overwrite_check, self.mirror_check,
                    self.detect_tables_check, self.generate_index_check,
                    self.embed_images_check, self.extract_images_check,
-                   self.strip_pagenumbers_check, self.ocr_check):
+                   self.strip_pagenumbers_check,
+                   self.strip_headers_footers_check, self.ocr_check):
             cb.toggled.connect(self._schedule_save)
         self.ocr_provider_combo.currentIndexChanged.connect(self._schedule_save)
         self.ocr_model_combo.currentTextChanged.connect(self._schedule_save)
@@ -502,6 +519,7 @@ class MainWindow(QMainWindow):
             "embed_images": self.embed_images_check.isChecked(),
             "extract_images": self.extract_images_check.isChecked(),
             "strip_pagenumbers": self.strip_pagenumbers_check.isChecked(),
+            "strip_headers_footers": self.strip_headers_footers_check.isChecked(),
             "theme": {
                 "flavor": flavor_data.value if isinstance(flavor_data, Flavor) else "mocha",
                 "accent": accent_data if isinstance(accent_data, str) else "mauve",
@@ -532,6 +550,7 @@ class MainWindow(QMainWindow):
             ("embed_images", self.embed_images_check),
             ("extract_images", self.extract_images_check),
             ("strip_pagenumbers", self.strip_pagenumbers_check),
+            ("strip_headers_footers", self.strip_headers_footers_check),
         ):
             if key in cfg:
                 widget.setChecked(bool(cfg[key]))
@@ -1171,6 +1190,7 @@ class MainWindow(QMainWindow):
             embed_pdf_images=self.embed_images_check.isChecked(),
             extract_pdf_images=self.extract_images_check.isChecked(),
             strip_pdf_page_numbers=self.strip_pagenumbers_check.isChecked(),
+            strip_pdf_headers_footers=self.strip_headers_footers_check.isChecked(),
             ocr=OcrConfig(
                 enabled=self.ocr_check.isChecked(),
                 model=self.ocr_model_combo.currentText().strip() or "gpt-4o",

@@ -92,6 +92,62 @@ def strip_page_numbers(markdown: str) -> tuple[str, int]:
     return "\n".join(out), removed
 
 
+def strip_headers_footers(
+    markdown: str, min_repeats: int = 3, min_length: int = 8
+) -> tuple[str, int]:
+    """Remove running headers/footers: lines that repeat across many pages.
+
+    PDF text extraction re-emits every page's running header and footer inline
+    (a signature banner, a "Page X of Y" strip, a document title bar, ...), so
+    the same line ends up scattered identically through the markdown. This pass
+    counts each non-blank line (compared on its stripped text) and removes every
+    occurrence of a line that:
+
+    * repeats at least ``min_repeats`` times — the core header/footer signal;
+    * is at least ``min_length`` characters long, so short repeated words in
+      prose ("Ja", "Visma", a lone list marker) are never touched;
+    * is not a heading or list item — structural markdown that may legitimately
+      recur and carries navigable meaning.
+
+    Frequency is the only page-structure proxy available once the text is a flat
+    markdown stream, so a header/footer on a document with fewer than
+    ``min_repeats`` pages will not reach the threshold and is deliberately kept
+    (better to leave boilerplate than delete real content). Lines inside fenced
+    code blocks are never counted or removed. Returns
+    ``(new_markdown, removed_count)``.
+    """
+    lines = markdown.split("\n")
+    fence = _compute_fence_lines(lines)
+
+    def _eligible(idx: int, line: str) -> bool:
+        if idx in fence:
+            return False
+        stripped = line.strip()
+        if len(stripped) < min_length:
+            return False
+        if stripped.startswith("#") or _LIST_ITEM_RE.match(line):
+            return False
+        return True
+
+    counts: dict[str, int] = {}
+    for i, line in enumerate(lines):
+        if _eligible(i, line):
+            counts[line.strip()] = counts.get(line.strip(), 0) + 1
+
+    boiler = {text for text, n in counts.items() if n >= min_repeats}
+    if not boiler:
+        return markdown, 0
+
+    out: list[str] = []
+    removed = 0
+    for i, line in enumerate(lines):
+        if _eligible(i, line) and line.strip() in boiler:
+            removed += 1
+            continue
+        out.append(line)
+    return "\n".join(out), removed
+
+
 def strip_empty_headings(markdown: str) -> tuple[str, int]:
     """Remove empty heading lines and demote image-only headings.
 
@@ -198,6 +254,93 @@ def _is_heading_line(line: str) -> bool:
 
 def _is_blank(line: str) -> bool:
     return line.strip() == ""
+
+
+def fix_form_feeds(text: str) -> tuple[str, int]:
+    """Strip form-feed (``\\x0c``) characters that pdfminer emits at page
+    boundaries.
+
+    The page-break control character survives into the markdown, usually glued
+    to the front of the first line of the next page (``\\x0c3.5 Tvister``),
+    where it corrupts that line and any heading detection on it. It carries no
+    content, so every occurrence is removed. Returns ``(new_markdown, count)``.
+    """
+    count = text.count("\x0c")
+    if count:
+        text = text.replace("\x0c", "")
+    return text, count
+
+
+# A numbered section title. Two shapes:
+#   * "3.6 Sekretess"  — a multi-level number with no trailing dot (depth >= 2)
+#   * "1. Tjänsteutbud" — a single number with a trailing dot (depth 1)
+# pdfminer emits both as plain text (the depth-1 ones as ordered-list markers),
+# so they render as body paragraphs / list items and run into adjacent text —
+# but in the source PDF they are section headings.
+_NUMBERED_HEADING_RE = re.compile(
+    r"^(?P<num>\d+(?:\.\d+)+|\d+\.)\s+(?P<title>\S.*?)\s*$"
+)
+# A line that is a single-number ordered-list marker (``N.`` / ``N)``). Used to
+# detect list clusters so a real list item is not mistaken for a heading.
+_NUM_ITEM_LINE_RE = re.compile(r"^\s*\d+[.)]\s")
+_BULLET_ITEM_RE = re.compile(r"^\s*[-*+]\s")
+
+
+def _adjacent_numbered_item(lines: list[str], i: int) -> bool:
+    """True if the nearest non-blank neighbour above or below line ``i`` is a
+    single-number list marker — i.e. line ``i`` sits inside a list cluster and
+    is probably a real ordered-list item, not a standalone section heading."""
+    j = i - 1
+    while j >= 0 and _is_blank(lines[j]):
+        j -= 1
+    if j >= 0 and _NUM_ITEM_LINE_RE.match(lines[j]):
+        return True
+    j = i + 1
+    while j < len(lines) and _is_blank(lines[j]):
+        j += 1
+    return j < len(lines) and bool(_NUM_ITEM_LINE_RE.match(lines[j]))
+
+
+def fix_numbered_section_headings(text: str) -> tuple[str, int]:
+    """Promote numbered section titles (``1. Foo`` / ``3.6 Bar``) to headings.
+
+    A line is promoted only when it is a section number followed by a *short*
+    title (<= 50 chars and <= 7 words) that does not end in sentence
+    punctuation. Those guards keep long numbered clauses
+    ("3.5.1 Uppkommer tvist ... domstol.") — body text, not headings —
+    untouched. Bullet items and existing headings are skipped.
+
+    Depth-1 numbers (``1.``) are ambiguous with genuine ordered-list items, so
+    one is promoted only when it stands alone (its nearest numbered neighbour is
+    not adjacent) — a real list like ``1. / 2. / 3.`` is left as a list. Heading
+    level tracks numbering depth (``N.`` -> ``##``, ``N.N`` -> ``###``,
+    ``N.N.N`` -> ``####``), capped at H6.
+
+    Must run *before* REJOIN so section titles are no longer list items when the
+    continuation-folding pass runs — otherwise the line after a title gets
+    merged into it. The downstream MD022 pass adds the surrounding blank lines.
+    Returns ``(new_markdown, promoted_count)``.
+    """
+    lines = text.split("\n")
+    fence = _compute_skip_lines(lines)
+    count = 0
+    for i, line in enumerate(lines):
+        if i in fence or line.lstrip().startswith("#") or _BULLET_ITEM_RE.match(line):
+            continue
+        m = _NUMBERED_HEADING_RE.match(line)
+        if not m:
+            continue
+        title = m.group("title")
+        if len(title) > 50 or len(title.split()) > 7 or title[-1] in ".:,;!":
+            continue
+        num = m.group("num")
+        depth = num.rstrip(".").count(".") + 1  # "1." -> 1, "3.6" -> 2
+        if depth == 1 and _adjacent_numbered_item(lines, i):
+            continue
+        level = min(depth + 1, 6)  # 1 -> ##, 2 -> ###, 3 -> ####
+        lines[i] = f"{'#' * level} {num} {title}"
+        count += 1
+    return "\n".join(lines), count
 
 
 def fix_hard_tabs(text: str) -> tuple[str, int]:
@@ -355,6 +498,13 @@ def fix_ordered_list_prefix(text: str) -> tuple[str, int]:
     Nested sub-lists are not specially handled — they're renumbered as part
     of whatever flat sequence they appear in, which matches markdownlint's
     per-level view.
+
+    Single-item blocks are left untouched. A lone ``N.`` separated from other
+    numbers by prose is almost always a section heading ("1. Overview",
+    "2. Scope", ... spread across pages) whose number carries meaning — the
+    old per-block reset rewrote each such heading to ``1.``, collapsing
+    "1./2./3." to "1./1./1.". Only a block with two or more items is a real
+    ordered list we can safely renumber.
     """
     lines = text.split("\n")
     fence = _compute_skip_lines(lines)
@@ -371,21 +521,15 @@ def fix_ordered_list_prefix(text: str) -> tuple[str, int]:
             continue
         indent = m.group("indent")
         delim = m.group("delim")
-        expected = 1
-        # Walk forward over items + their continuation/blank lines at this indent.
+        # Collect this block's item line indices, advancing i past the block
+        # (items + their continuation/blank lines at this indent).
+        item_indices: list[int] = []
         while i < len(lines):
             if i in fence:
                 break
             mi = _ORDERED_ITEM_RE.match(lines[i])
             if mi and mi.group("indent") == indent and mi.group("delim") == delim:
-                actual = int(mi.group("num"))
-                if actual != expected:
-                    after = mi.group("after")
-                    lines[i] = f"{indent}{expected}{delim}{after}{mi.group('text')}"
-                    count += 1
-                # one-style: every item stays at 1. ordered-style: bump.
-                if style == "ordered":
-                    expected += 1
+                item_indices.append(i)
                 i += 1
                 continue
             # Continuation: deeper indent or blank line inside the list.
@@ -393,6 +537,20 @@ def fix_ordered_list_prefix(text: str) -> tuple[str, int]:
                 i += 1
                 continue
             break
+        # Only a multi-item block is a genuine ordered list worth renumbering.
+        if len(item_indices) < 2:
+            continue
+        expected = 1
+        for idx in item_indices:
+            mi = _ORDERED_ITEM_RE.match(lines[idx])
+            actual = int(mi.group("num"))
+            if actual != expected:
+                after = mi.group("after")
+                lines[idx] = f"{indent}{expected}{delim}{after}{mi.group('text')}"
+                count += 1
+            # one-style: every item stays at 1. ordered-style: bump.
+            if style == "ordered":
+                expected += 1
     return "\n".join(lines), count
 
 
@@ -564,6 +722,110 @@ def fix_bare_numeric_callouts(text: str) -> tuple[str, int]:
     return "\n".join(lines), count
 
 
+# Unicode bullet glyphs that PDF text extraction emits literally at the start
+# of a list item instead of a real markdown marker. pdfminer (MarkItDown's PDF
+# backend) copies the glyph out of the content stream verbatim, so a bulleted
+# paragraph arrives as e.g. "● item text" — plain text to every markdown
+# renderer, with no list semantics.
+#
+# Only glyphs that are unambiguous list bullets are included. En/em dashes and
+# the middle dot (U+00B7) are deliberately excluded: they occur mid-sentence in
+# prose often enough that a line-start match would produce false positives.
+_BULLET_GLYPHS = "•‣⁃∙●○◦▪▫□◾◼◻"
+_UNICODE_BULLET_RE = re.compile(
+    rf"^(?P<indent>\s*)[{_BULLET_GLYPHS}]\s+(?P<text>\S.*)$"
+)
+
+
+def fix_unicode_bullets(text: str) -> tuple[str, int]:
+    """Rewrite literal unicode bullet glyphs at line start to markdown ``- ``.
+
+    PDF extraction (pdfminer) copies bullet glyphs such as ``●`` / ``•`` out of
+    the content stream as ordinary text, so a bulleted list arrives as a run of
+    paragraphs each beginning with the glyph and no list is rendered. Converting
+    the leading glyph to ``-`` restores real markdown list semantics, which the
+    downstream MD032 pass then spaces correctly.
+
+    Only a leading glyph followed by whitespace and item text is matched;
+    indentation is preserved so nested bullets keep their level. Fenced code is
+    left untouched. Returns ``(new_markdown, converted_count)``.
+    """
+    lines = text.split("\n")
+    fence = _compute_fence_lines(lines)
+    count = 0
+    for i, line in enumerate(lines):
+        if i in fence:
+            continue
+        m = _UNICODE_BULLET_RE.match(line)
+        if not m:
+            continue
+        lines[i] = f"{m.group('indent')}- {m.group('text')}"
+        count += 1
+    return "\n".join(lines), count
+
+
+# Once a wrapped item's accumulated text ends with one of these, the next
+# physical line is new content, not a continuation. Sentence-final punctuation
+# is the reliable signal that a PDF-wrapped item has ended.
+_ITEM_END_PUNCT = ".!?:;"
+
+# Block-level constructs that can never be a lazy continuation of a list item:
+# headings, blockquotes, table rows, fences, and HTML/angle-bracket lines
+# (which includes the ``<https://...>`` links MD034 produces on footer lines).
+_BLOCK_START_RE = re.compile(r"^\s*(?:#{1,6}\s|>|\||```|~~~|<)")
+
+
+def fix_orphaned_list_continuations(text: str) -> tuple[str, int]:
+    """Rejoin PDF-wrapped continuation lines back into their list item.
+
+    pdfminer hard-wraps long list items across physical lines, so a single
+    bullet arrives as::
+
+        - Tillgång till Developer Portal, ... till de
+        priser som gäller vid var tid.
+
+    The second line is a lazy continuation (no blank separates it), but the
+    downstream MD032 pass would insert a blank before it and split it into its
+    own paragraph. This pass folds such continuation lines back onto the item
+    line *before* MD032 runs.
+
+    A following line is treated as a continuation only when the accumulated
+    item text does not yet end in sentence-final punctuation (``.!?:;``) and
+    the line is plain running text — not blank, not another list item, not a
+    heading/table/quote/fence/HTML block. That punctuation guard keeps genuine
+    trailing paragraphs and page-footer artefacts (which follow a
+    period-terminated line) from being swallowed. Runs after ``BULLET`` so
+    ``●`` items are already ``-`` markers, and before the block-layout passes.
+    Returns ``(new_markdown, joined_count)``.
+    """
+    lines = text.split("\n")
+    fence = _compute_fence_lines(lines)
+    out: list[str] = []
+    count = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if i in fence or not _LIST_ITEM_RE.match(line):
+            out.append(line)
+            i += 1
+            continue
+        # Fold lazy continuations onto this list item.
+        item = line
+        i += 1
+        while i < n and i not in fence:
+            nxt = lines[i]
+            if _is_blank(nxt) or _LIST_ITEM_RE.match(nxt) or _BLOCK_START_RE.match(nxt):
+                break
+            if item.rstrip()[-1:] in _ITEM_END_PUNCT:
+                break
+            item = item.rstrip() + " " + nxt.strip()
+            count += 1
+            i += 1
+        out.append(item)
+    return "\n".join(out), count
+
+
 _FRONTMATTER_TITLE_RE = re.compile(r"^\s*title\s*:\s*\S", re.IGNORECASE)
 
 
@@ -614,18 +876,26 @@ def fix_trailing_newline(text: str) -> tuple[str, int]:
 
 
 # The fix order is load-bearing:
-#   1. MD010 first so subsequent regexes see only spaces.
+#   0. FORMFEED first so page-break junk never corrupts a heading match.
+#   1. MD010 next so subsequent regexes see only spaces.
 #   2. Per-line cleanups (MD009/MD018/MD026/MD034/MD029) before block layout.
+#      Bullet-glyph normalization (BULLET) and continuation-rejoin (REJOIN)
+#      run here too, so PDF ``●`` items become real ``-`` list items and any
+#      hard-wrapped item text is folded back before MD032 spaces the list.
 #   3. Block layout (MD022/MD031/MD032) adds blank lines.
 #   4. MD012 collapses any over-eager runs into a single blank.
 #   5. MD047 last so the trailing newline survives all transformations.
 _FIX_PIPELINE: tuple[tuple[str, "callable[[str], tuple[str, int]]"], ...] = (  # type: ignore[name-defined]
+    ("FORMFEED", fix_form_feeds),
     ("MD010", fix_hard_tabs),
     ("MD025", fix_md025_with_frontmatter),
     ("MD009", fix_trailing_whitespace),
     ("MD018", fix_missing_hash_space),
     ("MD026", fix_heading_trailing_punctuation),
     ("MD034", fix_bare_urls),
+    ("BULLET", fix_unicode_bullets),
+    ("HEADING", fix_numbered_section_headings),
+    ("REJOIN", fix_orphaned_list_continuations),
     ("CALLOUT", fix_bare_numeric_callouts),
     ("MD029", fix_ordered_list_prefix),
     ("MD022", fix_blanks_around_headings),

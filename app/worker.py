@@ -42,6 +42,7 @@ class ConversionWorker(QObject):
         embed_pdf_images: bool = False,
         extract_pdf_images: bool = False,
         strip_pdf_page_numbers: bool = False,
+        strip_pdf_headers_footers: bool = False,
         ocr: OcrConfig | None = None,
     ) -> None:
         super().__init__()
@@ -52,6 +53,7 @@ class ConversionWorker(QObject):
         self._embed_pdf_images = embed_pdf_images
         self._extract_pdf_images = extract_pdf_images
         self._strip_pdf_page_numbers = strip_pdf_page_numbers
+        self._strip_pdf_headers_footers = strip_pdf_headers_footers
         self._ocr = ocr or OcrConfig()
         self._cancelled = False
 
@@ -312,6 +314,7 @@ class ConversionWorker(QObject):
                 from .markdown_cleanup import (
                     apply_lint_fixes,
                     strip_empty_headings,
+                    strip_headers_footers,
                     strip_page_numbers,
                 )
 
@@ -323,6 +326,22 @@ class ConversionWorker(QObject):
                         f"  -> cleaned up {removed_headings} empty / "
                         "image-only heading(s)"
                     )
+
+                # Running-header/footer strip is opt-in and PDF-only — it
+                # removes lines that repeat across pages, which only PDF page
+                # furniture reliably does.
+                if (
+                    self._strip_pdf_headers_footers
+                    and item.source.suffix.lower() == ".pdf"
+                ):
+                    text_content, removed_hf = strip_headers_footers(
+                        text_content
+                    )
+                    if removed_hf:
+                        self.log.emit(
+                            f"  -> removed {removed_hf} running header/footer "
+                            "line(s)"
+                        )
 
                 # Page-number strip is opt-in and PDF-only — other formats
                 # rarely carry raw page numbers as their own paragraphs and
