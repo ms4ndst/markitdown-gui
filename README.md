@@ -1,6 +1,6 @@
 # MarkItDown GUI — Catppuccin
 
-![Application screenshot](screenshot1.png)
+![Application screenshot](screenshot.png)
 
 A Windows desktop GUI for batch-converting PDFs, Office documents, images,
 audio, HTML, EPUB and more into clean Markdown. Built on top of Microsoft's
@@ -222,6 +222,14 @@ scan-vs-text status in the background; scanned ones get a **SCAN** badge.
   by PDF xref (PDFs) or SHA-256 (OOXML / EPUB). Off by default; mutually
   exclusive with base64.
 - *Generate index.md for large files* — only fires for outputs > 500 lines.
+- *Strip page numbers in PDFs* — removes isolated page-number lines
+  (`5`, `- 5 -`, `Page 5 of 20`) left as their own paragraphs. PDF-only.
+- *Strip headers/footers in PDFs/DOCX* — removes lines that repeat 3+ times
+  across the document (a running banner or title bar). Works for PDF page
+  furniture and for DOCX files that carry the same banner typed into the
+  body of every page (e.g. DOCX exported from PDF); real Word header/footer
+  objects never reach the markdown in the first place, so there's nothing
+  to strip there.
 
 ### 4. OCR (optional)
 

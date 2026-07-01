@@ -99,9 +99,13 @@ def strip_headers_footers(
 
     PDF text extraction re-emits every page's running header and footer inline
     (a signature banner, a "Page X of Y" strip, a document title bar, ...), so
-    the same line ends up scattered identically through the markdown. This pass
-    counts each non-blank line (compared on its stripped text) and removes every
-    occurrence of a line that:
+    the same line ends up scattered identically through the markdown. DOCX
+    files never carry the *real* Word header/footer objects into the markdown
+    — mammoth only reads the document body — but a banner typed directly into
+    the body of every page (common in DOCX exported from PDF) produces the
+    identical repeated-line pattern, so this pass is applied to DOCX output
+    too. This pass counts each non-blank line (compared on its stripped text)
+    and removes every occurrence of a line that:
 
     * repeats at least ``min_repeats`` times — the core header/footer signal;
     * is at least ``min_length`` characters long, so short repeated words in

@@ -327,12 +327,17 @@ class ConversionWorker(QObject):
                         "image-only heading(s)"
                     )
 
-                # Running-header/footer strip is opt-in and PDF-only — it
-                # removes lines that repeat across pages, which only PDF page
-                # furniture reliably does.
+                # Running-header/footer strip is opt-in, PDF + DOCX. Real
+                # Word header/footer XML parts (header1.xml, footer1.xml)
+                # are never even in the markdown — mammoth (our .docx
+                # converter) only reads word/document.xml and drops them —
+                # but a banner typed directly into the body of every page
+                # (common in DOCX exported from PDF) repeats identically
+                # just like PDF page furniture, so the same frequency-based
+                # pass catches it.
                 if (
                     self._strip_pdf_headers_footers
-                    and item.source.suffix.lower() == ".pdf"
+                    and item.source.suffix.lower() in (".pdf", ".docx")
                 ):
                     text_content, removed_hf = strip_headers_footers(
                         text_content

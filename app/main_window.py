@@ -362,17 +362,19 @@ class MainWindow(QMainWindow):
         )
 
         self.strip_headers_footers_check = QCheckBox(
-            "Strip headers/footers in PDFs"
+            "Strip headers/footers in PDFs/DOCX"
         )
         self.strip_headers_footers_check.setChecked(False)
         self.strip_headers_footers_check.setToolTip(
             "Remove running headers and footers — lines that repeat across\n"
-            "pages, such as a signature banner or document title bar that\n"
-            "PDF text extraction re-emits inline on every page. A line is\n"
-            "removed only when it recurs 3+ times and is not a heading or\n"
-            "list item, so unique body text is never touched. Headers/footers\n"
-            "on documents with fewer than 3 pages stay (too few repeats to\n"
-            "tell them apart from real content)."
+            "pages, such as a signature banner or document title bar. PDF\n"
+            "text extraction re-emits these inline on every page; DOCX files\n"
+            "exported from a PDF (or built page-by-page with a banner typed\n"
+            "into the body) show the same pattern. A line is removed only\n"
+            "when it recurs 3+ times and is not a heading or list item, so\n"
+            "unique body text is never touched. Headers/footers on documents\n"
+            "with fewer than 3 pages stay (too few repeats to tell them apart\n"
+            "from real content)."
         )
 
         general_row = QHBoxLayout()
