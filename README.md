@@ -16,7 +16,9 @@ extras layered on top:
    relevant section without reading the whole thing.
 4. **Scanned-PDF detection + smart routing** — files identified as scanned
    are tagged with a SCAN badge in the file list and routed through the OCR
-   converter; everything else takes the fast text path.
+   converter; standalone image files (`.png`, `.jpg`, `.jpeg`) are transcribed
+   to Markdown by the same vision model; everything else takes the fast text
+   path.
 5. **Provider preset dropdown + local LLM discovery** — one-click setup for
    OpenAI, Azure, Google Gemini, Groq, OpenRouter, Mistral, LM Studio, and
    Ollama; a Detect button probes localhost for running servers and lists
@@ -112,10 +114,13 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
 - The badge tells the converter to route the file through OCR; non-scanned
   files skip OCR entirely (no wasted LLM calls)
 
-### OCR images in PDFs *(optional)*
+### OCR images in PDFs & image files *(optional)*
 - Uses Microsoft's `markitdown-ocr` plugin with any OpenAI-compatible vision
   model — including OpenAI, Azure, Google Gemini, Groq, OpenRouter, Mistral,
   LM Studio, and Ollama
+- **Standalone image files** (`.png`, `.jpg`, `.jpeg`) are transcribed
+  verbatim to structured Markdown by the same vision model — no plugin
+  required for these, only the `openai` package
 - **Provider preset dropdown** — pick a provider and the endpoint + a known
   vision model fill in automatically
 - **Test OCR button** — sends a tiny "Hello" image and shows the response
@@ -233,9 +238,11 @@ scan-vs-text status in the background; scanned ones get a **SCAN** badge.
 
 ### 4. OCR (optional)
 
-Tick **"OCR images in PDFs (LLM vision)"** to enable. With OCR on:
+Tick **"OCR images in PDFs & image files (LLM vision)"** to enable. With OCR on:
 
 - **Files with the SCAN badge** route through the LLM vision model
+- **Standalone image files** (`.png`, `.jpg`, `.jpeg`) are transcribed to
+  Markdown by the same vision model
 - **Everything else** still uses the fast text converter — no LLM calls
 
 The OCR row has 4 inputs:
