@@ -430,23 +430,28 @@ branches use Python's stdlib `zipfile` and `hashlib` only.
 
 ### How per-file converter routing works
 
-`ConversionWorker._build_converters()` returns `(text_md, ocr_md)`:
+`ConversionWorker._build_converters()` returns `(text_md, ocr_md, image_md)`:
 
 - `text_md` — standard MarkItDown + `PdfPlumberTableConverter` at -1.0
 - `ocr_md` — MarkItDown with `enable_plugins=True` and the OCR plugin
   registered; built only when OCR is on **and** at least one queued file is
-  scanned
+  a scanned PDF
+- `image_md` — MarkItDown with a vision `llm_client` and a verbatim
+  transcription `llm_prompt`; built only when OCR is on **and** at least one
+  queued file is a standalone image (`.png`, `.jpg`, `.jpeg`). Uses the
+  built-in `ImageConverter`, no plugin required.
 
 Each item is then routed by `_pick_converter()`:
 
-| OCR checkbox | File is scanned | Route |
+| OCR checkbox | File kind | Route |
 |---|---|---|
 | Off | any | `text_md` |
-| On | yes | `ocr_md` (LLM vision) |
-| On | no | `text_md` (no LLM calls) |
+| On | standalone image (png/jpg/jpeg) | `image_md` (LLM vision, transcription) |
+| On | scanned PDF | `ocr_md` (LLM vision, plugin) |
+| On | anything else | `text_md` (no LLM calls) |
 
-The log shows the chosen route per file: `Converting [OCR]: …` or
-`Converting [text]: …`.
+The log shows the chosen route per file: `Converting [IMAGE-OCR]: …`,
+`Converting [OCR]: …`, or `Converting [text]: …`.
 
 ### How the indexer works
 

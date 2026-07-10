@@ -656,11 +656,12 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout()
         outer.setSpacing(6)
         top = QHBoxLayout()
-        self.ocr_check = QCheckBox("OCR images in PDFs (LLM vision)")
+        self.ocr_check = QCheckBox("OCR images in PDFs && image files (LLM vision)")
         self.ocr_check.setChecked(False)
         self.ocr_check.setToolTip(
-            "Extract text from images embedded in PDFs and from scanned pages\n"
-            "by sending them to an OpenAI-compatible vision model.\n"
+            "Extract text from scanned PDFs and from standalone image files\n"
+            "(.png, .jpg, .jpeg) by sending them to an OpenAI-compatible\n"
+            "vision model, transcribing the text into structured Markdown.\n"
             "Requires markitdown-ocr + openai packages."
         )
         self.ocr_check.toggled.connect(self._on_ocr_toggled)

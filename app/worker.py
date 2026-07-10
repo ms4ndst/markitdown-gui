@@ -9,6 +9,24 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from markitdown import MarkItDown
 
+# Standalone image formats the built-in ImageConverter can send to a vision
+# model. Kept in sync with markitdown's ImageConverter.ACCEPTED_FILE_EXTENSIONS
+# — bmp/tiff/gif are accepted as *inputs* by the GUI but the converter can't
+# hand them to the LLM, so they're deliberately excluded here.
+TRANSCRIBABLE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+
+# Prompt that turns the LLM-vision path from "describe this image" into a
+# verbatim text transcription. Without it MarkItDown's default is
+# "Write a detailed caption for this image." which paraphrases instead of
+# extracting the text.
+IMAGE_TRANSCRIPTION_PROMPT = (
+    "Transcribe all text in this image verbatim into clean, well-structured "
+    "Markdown. Preserve the reading order and the document structure: use "
+    "headings, lists, tables, and bold/italic emphasis where the original "
+    "uses them. Do not describe the image, add commentary, or wrap the output "
+    "in a code fence — output only the transcribed content as Markdown."
+)
+
 
 @dataclass
 class ConversionItem:
@@ -78,8 +96,9 @@ class ConversionWorker(QObject):
             )
         return md
 
-    def _build_ocr_markitdown(self) -> MarkItDown:
-        """Build a MarkItDown with the LLM-vision OCR plugin registered."""
+    def _build_llm_client(self):
+        """Build the OpenAI-compatible client shared by the PDF-OCR plugin and
+        the standalone-image transcription path."""
         try:
             from openai import OpenAI
         except ImportError as exc:
@@ -96,44 +115,89 @@ class ConversionWorker(QObject):
             # Local endpoints (LM Studio, Ollama) ignore the key but the
             # OpenAI client still requires the field to be set.
             client_kwargs.setdefault("api_key", "not-needed")
-        client = OpenAI(**client_kwargs)
+        return OpenAI(**client_kwargs)
+
+    def _build_ocr_markitdown(self) -> MarkItDown:
+        """Build a MarkItDown with the LLM-vision OCR plugin registered."""
         md = MarkItDown(
             enable_plugins=True,
-            llm_client=client,
+            llm_client=self._build_llm_client(),
             llm_model=self._ocr.model,
         )
         self._verify_ocr_plugin_loaded(md)
         return md
 
-    def _build_converters(self) -> tuple[MarkItDown, MarkItDown | None]:
-        """Return ``(text_md, ocr_md)``. ``ocr_md`` is ``None`` when OCR is off
-        or when no items in the queue are scanned PDFs."""
+    def _build_image_markitdown(self) -> MarkItDown:
+        """Build a MarkItDown that transcribes standalone image files via a
+        vision model. A custom converter (registered ahead of the built-in
+        ImageConverter) returns only the transcription — no EXIF block, no
+        '# Description:' heading — so the output is clean Markdown."""
+        from .image_transcription_converter import ImageTranscriptionConverter
+
+        md = MarkItDown(
+            llm_client=self._build_llm_client(),
+            llm_model=self._ocr.model,
+            llm_prompt=IMAGE_TRANSCRIPTION_PROMPT,
+        )
+        md.register_converter(ImageTranscriptionConverter(), priority=-1.0)
+        return md
+
+    @staticmethod
+    def _is_transcribable_image(item: ConversionItem) -> bool:
+        return item.source.suffix.lower() in TRANSCRIBABLE_IMAGE_EXTENSIONS
+
+    def _build_converters(
+        self,
+    ) -> tuple[MarkItDown, MarkItDown | None, MarkItDown | None]:
+        """Return ``(text_md, ocr_md, image_md)``.
+
+        ``ocr_md`` handles scanned PDFs and is ``None`` when OCR is off or no
+        scanned PDFs are queued. ``image_md`` transcribes standalone image
+        files and is ``None`` when OCR is off or no images are queued. Both
+        LLM paths are gated only by the single OCR toggle."""
         text_md = self._build_text_markitdown()
 
         if not self._ocr.enabled:
-            return text_md, None
+            return text_md, None, None
 
         needs_ocr = any(item.is_scanned for item in self._items)
-        if not needs_ocr:
-            self.log.emit(
-                "OCR enabled but no scanned PDFs in the queue — using the "
-                "fast text converter for every file."
-            )
-            return text_md, None
+        needs_image = any(self._is_transcribable_image(i) for i in self._items)
 
-        ocr_md = self._build_ocr_markitdown()
-        self.log.emit(
-            f"OCR enabled for scanned PDFs — model={self._ocr.model}"
-            + (f", endpoint={self._ocr.base_url}" if self._ocr.base_url else "")
+        if not needs_ocr and not needs_image:
+            self.log.emit(
+                "OCR enabled but no scanned PDFs or image files in the queue "
+                "— using the fast text converter for every file."
+            )
+            return text_md, None, None
+
+        endpoint = (
+            f", endpoint={self._ocr.base_url}" if self._ocr.base_url else ""
         )
-        return text_md, ocr_md
+        ocr_md = None
+        if needs_ocr:
+            ocr_md = self._build_ocr_markitdown()
+            self.log.emit(
+                f"OCR enabled for scanned PDFs — model={self._ocr.model}"
+                + endpoint
+            )
+        image_md = None
+        if needs_image:
+            image_md = self._build_image_markitdown()
+            self.log.emit(
+                f"Image transcription enabled — model={self._ocr.model}"
+                + endpoint
+            )
+        return text_md, ocr_md, image_md
 
     def _pick_converter(
         self,
         item: ConversionItem,
         text_md: MarkItDown,
         ocr_md: MarkItDown | None,
+        image_md: MarkItDown | None,
     ) -> tuple[MarkItDown, str]:
+        if image_md is not None and self._is_transcribable_image(item):
+            return image_md, "IMAGE-OCR"
         if ocr_md is not None and item.is_scanned:
             return ocr_md, "OCR"
         return text_md, "text"
@@ -151,7 +215,7 @@ class ConversionWorker(QObject):
 
     def run(self) -> None:
         try:
-            text_md, ocr_md = self._build_converters()
+            text_md, ocr_md, image_md = self._build_converters()
         except Exception as exc:
             self.log.emit("=" * 60)
             self.log.emit(f"! Failed to initialise converter: {exc}")
@@ -192,7 +256,7 @@ class ConversionWorker(QObject):
                 self.log.emit("Conversion cancelled by user.")
                 break
 
-            md, route = self._pick_converter(item, text_md, ocr_md)
+            md, route = self._pick_converter(item, text_md, ocr_md, image_md)
             self.progress.emit(index, total, item.source.name)
             self.log.emit(f"Converting [{route}]: {item.source}")
 
@@ -385,7 +449,7 @@ class ConversionWorker(QObject):
                 if char_count < 50:
                     self.log.emit(
                         "  ! Warning: output is nearly empty. If this is a "
-                        "scanned PDF, enable 'OCR images in PDFs' and provide "
+                        "scanned PDF or an image file, enable OCR and provide "
                         "a vision model + API key."
                     )
 
