@@ -21,7 +21,9 @@ keep them.
 In addition to the empty-heading pass, this module exposes ``apply_lint_fixes``
 — a batch of safe auto-fixes for the markdownlint rules whose violations have
 a single mechanical correction (MD009/MD010/MD012/MD018/MD022/MD025/MD026/
-MD029/MD031/MD032/MD034/MD047). MD025 is fixed only when YAML frontmatter
+MD029/MD031/MD032/MD034/MD047), plus a non-markdownlint ``TABLE`` pass that
+rebuilds PDF-mangled tables (missing or misplaced delimiter rows) so a parser
+never trips its nesting-depth guard on them. MD025 is fixed only when YAML frontmatter
 declares a ``title:`` (the demotion is then unambiguous — the doc said its
 own title in metadata, the body shouldn't repeat it as H1). Rules that
 require human judgment (MD011, MD024, MD033, MD041, MD042, MD045) are left
@@ -879,6 +881,113 @@ def fix_trailing_newline(text: str) -> tuple[str, int]:
     return (desired, 0 if desired == text else 1)
 
 
+# A table row: any line whose first non-space character is a pipe.
+_TABLE_ROW_RE = re.compile(r"^\s*\|")
+# A GFM delimiter row: pipes, spaces, colons and dashes only, with at least
+# one dash (so a blank ``|   |`` spacer row is never mistaken for one).
+_TABLE_SEP_RE = re.compile(r"^\s*\|[\s:\-|]*-[\s:\-|]*\|\s*$")
+
+
+def _table_col_count(line: str) -> int:
+    """Number of cells in a pipe row (outer pipes stripped, ``\\|`` kept whole)."""
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|"):
+        body = body[:-1]
+    return len(re.split(r"(?<!\\)\|", body))
+
+
+def _is_valid_gfm_table(region: list[str]) -> bool:
+    """True when ``region`` already parses as a GFM table.
+
+    The parse-critical shape is: at least two rows, row 2 is the delimiter,
+    row 1 is not, and no other delimiter rows appear (a stray delimiter mid
+    table is exactly the page-break defect this pass repairs). Column widths
+    are deliberately *not* checked — GFM tolerates ragged rows, and reflowing
+    a valid-but-ragged table would only churn otherwise-fine output.
+    """
+    if len(region) < 2:
+        return False
+    if _TABLE_SEP_RE.match(region[0]) or not _TABLE_SEP_RE.match(region[1]):
+        return False
+    return not any(_TABLE_SEP_RE.match(r) for r in region[2:])
+
+
+def _repair_table_region(region: list[str]) -> list[str]:
+    """Rebuild a malformed pipe-run into a valid GFM table.
+
+    Every delimiter row is dropped, the first surviving row becomes the
+    header, a single delimiter row is inserted after it, and short rows are
+    padded to the header's width. A run with fewer than two non-delimiter
+    rows is not a table (a lone ``| x |`` line) and is returned unchanged.
+    """
+    data = [r for r in region if not _TABLE_SEP_RE.match(r)]
+    if len(data) < 2:
+        return region
+    width = _table_col_count(data[0])
+
+    def pad(line: str) -> str:
+        deficit = width - _table_col_count(line)
+        return line.rstrip() + " |" * deficit if deficit > 0 else line.rstrip()
+
+    header = pad(data[0])
+    sep = "| " + " | ".join(["---"] * width) + " |"
+    return [header, sep, *(pad(r) for r in data[1:])]
+
+
+def fix_malformed_tables(text: str) -> tuple[str, int]:
+    """Repair PDF-extracted tables that break markdown parsers.
+
+    pdfminer-fallback PDF output emits header rows with no delimiter row and
+    scatters repeated page-break headers as stray delimiter rows mid-table.
+    A parser that cannot resolve the pipe-run into a table treats it as
+    run-on paragraph continuation and eventually trips its nesting-depth
+    guard ("input is too deeply nested / a very large table"), refusing the
+    whole document.
+
+    Each maximal run of consecutive pipe rows (outside fenced code and YAML
+    front matter) is inspected. A run that already parses as a GFM table is
+    left byte-for-byte untouched — this pass never reformats the valid tables
+    the pdfplumber converter produces. A malformed run is rebuilt via
+    :func:`_repair_table_region` and fenced with a blank line on each side so
+    it parses standalone (the downstream MD012 pass collapses any doubled
+    blanks). Returns ``(new_markdown, repaired_region_count)``.
+    """
+    lines = text.split("\n")
+    skip = _compute_skip_lines(lines)
+    out: list[str] = []
+    repaired = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        if i in skip or not _TABLE_ROW_RE.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while j < n and j not in skip and _TABLE_ROW_RE.match(lines[j]):
+            j += 1
+        region = lines[i:j]
+        if _is_valid_gfm_table(region):
+            out.extend(region)
+            i = j
+            continue
+        new_region = _repair_table_region(region)
+        if new_region == region:
+            out.extend(region)  # not a table (lone pipe line); leave as-is
+            i = j
+            continue
+        repaired += 1
+        if out and not _is_blank(out[-1]):
+            out.append("")
+        out.extend(new_region)
+        if j < n and not _is_blank(lines[j]):
+            out.append("")
+        i = j
+    return "\n".join(out), repaired
+
+
 # The fix order is load-bearing:
 #   0. FORMFEED first so page-break junk never corrupts a heading match.
 #   1. MD010 next so subsequent regexes see only spaces.
@@ -887,8 +996,12 @@ def fix_trailing_newline(text: str) -> tuple[str, int]:
 #      run here too, so PDF ``●`` items become real ``-`` list items and any
 #      hard-wrapped item text is folded back before MD032 spaces the list.
 #   3. Block layout (MD022/MD031/MD032) adds blank lines.
-#   4. MD012 collapses any over-eager runs into a single blank.
-#   5. MD047 last so the trailing newline survives all transformations.
+#   4. TABLE repairs malformed pipe-runs (missing / misplaced delimiter rows
+#      from PDF page breaks) and fences each with blank lines — it must run
+#      after the list/heading spacing passes (so their blanks don't split a
+#      table mid-repair) and before MD012 collapses the blanks it inserts.
+#   5. MD012 collapses any over-eager runs into a single blank.
+#   6. MD047 last so the trailing newline survives all transformations.
 _FIX_PIPELINE: tuple[tuple[str, "callable[[str], tuple[str, int]]"], ...] = (  # type: ignore[name-defined]
     ("FORMFEED", fix_form_feeds),
     ("MD010", fix_hard_tabs),
@@ -905,6 +1018,7 @@ _FIX_PIPELINE: tuple[tuple[str, "callable[[str], tuple[str, int]]"], ...] = (  #
     ("MD022", fix_blanks_around_headings),
     ("MD031", fix_blanks_around_fenced_code),
     ("MD032", fix_blanks_around_lists),
+    ("TABLE", fix_malformed_tables),
     ("MD012", fix_consecutive_blanks),
     ("MD047", fix_trailing_newline),
 )

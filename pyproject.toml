@@ -44,6 +44,12 @@ dependencies = [
     "openai",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 # gui-scripts (not scripts) so Windows installs a `pythonw.exe`-based
 # launcher: double-clicking or running `markitdown-gui` does NOT spawn a
 # console window behind the Qt UI. Treated the same as [project.scripts]
