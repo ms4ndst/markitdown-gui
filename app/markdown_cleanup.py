@@ -183,6 +183,151 @@ def strip_empty_headings(markdown: str) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Table-of-contents removal
+# ---------------------------------------------------------------------------
+
+# A dotted-leader TOC entry: a title, a run of >= 3 dots (optionally
+# space-separated, as some PDFs render them), then a trailing page number.
+# The long ".... 12" leaders a contents page extracts to match; ordinary
+# prose — which never ends in a dot-run followed by a bare number — does not.
+_TOC_DOTLEADER_RE = re.compile(r"^\s*\S.*?(?:\.\s*){3,}\d{1,6}\s*$")
+
+# A markdown-anchor TOC entry: a list item whose whole payload is one link,
+# e.g. ``- [Introduction](#introduction)`` (Word-TOC / md-export shape).
+_TOC_LINK_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[[^\]]+\]\([^)]*\)\s*$")
+
+# Heading text (case-folded, surrounding punctuation stripped) that names a
+# contents page, across the languages these documents appear in. Matched by
+# exact membership *or* ``startswith`` so "Table of Content" (no plural) and
+# "Innehållsförteckning" are both caught.
+_TOC_HEADING_TITLES: frozenset[str] = frozenset(
+    {
+        "contents",
+        "table of contents",
+        "table of content",
+        "toc",
+        "innehåll",
+        "innehållsförteckning",
+        "indholdsfortegnelse",
+        "sisällys",
+        "sisällysluettelo",
+        "table des matières",
+        "inhaltsverzeichnis",
+    }
+)
+
+# At least this many dotted-leader entries must appear before a *heading-less*
+# run is treated as a contents page — a single "foo .... 3" line in prose is
+# not a TOC, three in a row is.
+_MIN_TOC_ENTRIES = 3
+
+
+def _is_toc_entry(line: str) -> bool:
+    return bool(_TOC_DOTLEADER_RE.match(line) or _TOC_LINK_ITEM_RE.match(line))
+
+
+def _toc_heading_title(line: str) -> str | None:
+    """Case-folded title of ``line`` if it is a contents-page heading, else None."""
+    if not line.lstrip().startswith("#"):
+        return None
+    m = _HEADING_LINE_RE.match(line)
+    if not m or not m.group("hashes"):
+        return None
+    title = m.group("text").strip().strip(".:—–-").strip().casefold()
+    if not title:
+        return None
+    if title in _TOC_HEADING_TITLES or title.startswith("table of content"):
+        return title
+    return None
+
+
+def strip_table_of_contents(markdown: str) -> tuple[str, int]:
+    """Remove a document's own table-of-contents block.
+
+    Gated by the caller on the "generate index" option: when a sidecar
+    ``.index.md`` is produced the document's contents page is redundant
+    navigation — and, in PDF-extracted form (long dotted leaders with
+    trailing page numbers that link nowhere), pure noise. Two shapes are
+    removed:
+
+    * a **TOC heading** ("Table of Contents", "Innehåll", ...) plus the block
+      of dotted-leader / anchor-link entries that follows it, and
+    * a **heading-less dotted-leader run** of at least ``_MIN_TOC_ENTRIES``
+      entries, which a contents page often becomes when its heading is lost.
+
+    While inside a block, blank lines and the contents pages' own footer page
+    numbers are absorbed; the block ends at the first line of real content
+    (a heading, prose, or table). Fenced code and YAML front matter are never
+    touched. Returns ``(new_markdown, removed_line_count)``.
+    """
+    lines = markdown.split("\n")
+    skip = _compute_skip_lines(lines)
+    n = len(lines)
+    remove = [False] * n
+
+    def _consume(start: int) -> tuple[int, int]:
+        """From ``start``, walk the TOC block. Return ``(last_removable, entries)``.
+
+        ``last_removable`` is the index of the final non-blank TOC line (an
+        entry or an interspersed page number); trailing blanks are excluded so
+        the blank before the next real block survives. Stops at the first line
+        that is neither blank, a TOC entry, nor an isolated page number.
+        """
+        j = start
+        entries = 0
+        last = start - 1
+        while j < n and j not in skip:
+            if _is_blank(lines[j]):
+                j += 1
+                continue
+            if _is_toc_entry(lines[j]):
+                entries += 1
+                last = j
+                j += 1
+                continue
+            if _looks_like_page_number(lines[j]):  # a TOC page's own footer number
+                last = j
+                j += 1
+                continue
+            break
+        return last, entries
+
+    i = 0
+    while i < n:
+        if i in skip:
+            i += 1
+            continue
+        if _toc_heading_title(lines[i]) is not None:
+            last, entries = _consume(i + 1)
+            if entries >= 2:
+                for k in range(i, last + 1):
+                    remove[k] = True
+                i = last + 1
+                continue
+            i += 1
+            continue
+        if _TOC_DOTLEADER_RE.match(lines[i]):
+            last, entries = _consume(i)
+            if entries >= _MIN_TOC_ENTRIES:
+                for k in range(i, last + 1):
+                    remove[k] = True
+                i = last + 1
+                continue
+            i = max(last + 1, i + 1)
+            continue
+        i += 1
+
+    removed = sum(remove)
+    if not removed:
+        return markdown, 0
+    kept = [ln for k, ln in enumerate(lines) if not remove[k]]
+    new_md = "\n".join(kept)
+    if markdown.endswith("\n") and not new_md.endswith("\n"):
+        new_md += "\n"
+    return new_md, removed
+
+
+# ---------------------------------------------------------------------------
 # Lint auto-fix pass
 # ---------------------------------------------------------------------------
 

@@ -380,6 +380,7 @@ class ConversionWorker(QObject):
                     strip_empty_headings,
                     strip_headers_footers,
                     strip_page_numbers,
+                    strip_table_of_contents,
                 )
 
                 text_content, removed_headings = strip_empty_headings(
@@ -427,6 +428,22 @@ class ConversionWorker(QObject):
                             f"  -> stripped {removed_pages} page-number line(s)"
                         )
 
+                # When a sidecar index is being generated, the document's own
+                # table of contents is redundant navigation (and, from PDFs, a
+                # block of dotted-leader lines that link nowhere), so strip it.
+                # Runs before the lint pass so MD012/MD022 tidy the gap it
+                # leaves, and before the index is built below so the same
+                # cleaned text feeds both the main file and its index.
+                if self._generate_index:
+                    text_content, removed_toc = strip_table_of_contents(
+                        text_content
+                    )
+                    if removed_toc:
+                        self.log.emit(
+                            f"  -> removed table of contents ({removed_toc} "
+                            "line(s))"
+                        )
+
                 # Run the markdownlint auto-fix pass over the safely-fixable
                 # rules (MD009/MD010/MD012/MD018/MD022/MD026/MD029/MD031/
                 # MD032/MD034/MD047). Anything that needs human judgment
@@ -456,10 +473,13 @@ class ConversionWorker(QObject):
                 if self._generate_index:
                     from .indexer import build_index, should_index
 
-                    if should_index(result.text_content):
+                    # Build from the written text (TOC-stripped, lint-fixed) so
+                    # the index's line numbers match the main file and it never
+                    # re-lists the contents page as false headings.
+                    if should_index(text_content):
                         index_path = item.destination.with_suffix(".index.md")
                         index_path.write_text(
-                            build_index(result.text_content, item.source.name),
+                            build_index(text_content, item.source.name),
                             encoding="utf-8",
                         )
                         self.log.emit(f"  -> {index_path}")

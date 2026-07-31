@@ -320,7 +320,9 @@ class MainWindow(QMainWindow):
         self.generate_index_check.setToolTip(
             "For converted files over ~500 lines, write a sidecar\n"
             "<name>.index.md listing headings and API endpoints with\n"
-            "line numbers so Claude can jump straight to relevant sections."
+            "line numbers so Claude can jump straight to relevant sections.\n"
+            "The document's own table of contents is removed from the main\n"
+            "file, since the sidecar index replaces it."
         )
 
         self.detect_tables_check = QCheckBox("Detect tables in PDFs")
