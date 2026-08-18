@@ -171,6 +171,24 @@ feature; the rest of the app runs fine without them — use
 `pip install --no-deps .` and curate manually if you want a leaner
 footprint.
 
+### Linux installer
+
+On Linux, [`install.sh`](install.sh) sets up a dedicated venv under
+`~/.local/share/markitdown-gui`, a `markitdown-gui` launcher on
+`~/.local/bin`, and a desktop entry + icon so the app shows up in your
+application menu:
+
+```bash
+git clone <this-repo>
+cd markitdown_gui
+./install.sh
+```
+
+Run [`uninstall.sh`](uninstall.sh) to remove everything it created (your
+config/API key under `~/.config/MarkItDown/` is left in place). Packaging
+files (icon, `.desktop` template) live under
+[`packaging/linux/`](packaging/linux/).
+
 ---
 
 ## Run
