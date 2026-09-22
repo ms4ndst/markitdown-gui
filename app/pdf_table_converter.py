@@ -15,13 +15,18 @@ Strategy
    paragraphs keep their reading order.
 4. If detection fails or no tables survive, fall back to plain pdfminer text
    for the whole document — never silently emit a broken table.
+5. A wide/tall table that gets cut off by a page break is reunited with its
+   continuation on the next page (see ``_bounds_match`` / the merge loop in
+   ``PdfPlumberTableConverter.convert``) instead of being emitted as two
+   separate, truncated-looking tables — or, worse, silently dropped when the
+   continuation alone fails the "looks like a real table" heuristics.
 """
 
 from __future__ import annotations
 
 import io
 from collections import Counter
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NamedTuple
 
 from markitdown import (
     DocumentConverter,
@@ -149,8 +154,8 @@ def _merge_zebra_rows(rows: list[list[str]]) -> list[list[str]]:
     return merged
 
 
-def _looks_like_real_table(rows: list[list[str]]) -> bool:
-    if len(rows) < 1 + MIN_DATA_ROWS:
+def _looks_like_real_table(rows: list[list[str]], *, min_data_rows: int = MIN_DATA_ROWS) -> bool:
+    if len(rows) < 1 + min_data_rows:
         return False
     if not rows[0] or len(rows[0]) < MIN_COLUMNS:
         return False
@@ -179,7 +184,61 @@ def _table_to_markdown(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _clean_table(raw_rows: list[list[Any]]) -> str | None:
+class TableEdge(NamedTuple):
+    """A table touching the very top or bottom of a page — a candidate to be
+    reunited with its continuation on the adjacent page."""
+
+    raw_rows: list[list[Any]]
+    col_bounds: tuple[float, ...] | None
+
+
+def _column_bounds(t: Any) -> tuple[float, ...] | None:
+    """Left-edge x-position of every column, read from the table's own ruling
+    lines via its first row's cells. Two tables sharing the same column grid
+    are strong evidence they are the same source table split by a page break
+    — pdfplumber places both at identical x-coordinates since it derives them
+    from the PDF's ruling lines, which repeat unchanged across pages for a
+    single continued table.
+    """
+    try:
+        rows = t.rows
+    except Exception:
+        return None
+    if not rows:
+        return None
+    cells = rows[0].cells
+    bounds = [c[0] for c in cells if c is not None]
+    if len(bounds) < 2:
+        return None
+    return tuple(round(b, 1) for b in bounds)
+
+
+def _bounds_match(a: tuple[float, ...] | None, b: tuple[float, ...] | None, tol: float = 3.0) -> bool:
+    if a is None or b is None or len(a) != len(b):
+        return False
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def _starts_with_header_row(rows: list[list[Any]], header_row: list[Any] | None) -> bool:
+    """True when ``rows``' first row is identical to ``header_row``.
+
+    Used to *veto* a page-break merge, not to trust it: a genuine
+    continuation resumes with data, not a repeat of the header (documents in
+    the wild that reuse the same generic column template — "Field / Type /
+    Size / Comment" and the like — across many unrelated tables are common,
+    and on such a document, two distinct tables landing back-to-back across a
+    page break would otherwise look identical to one split table). A leading
+    fragment that opens with the exact header text is far more likely a new,
+    unrelated table that happens to share the template than a continuation
+    that repeats its header — so this blocks the merge rather than stripping
+    the row and proceeding.
+    """
+    if not rows or not header_row:
+        return False
+    return [_cell(c) for c in rows[0]] == [_cell(c) for c in header_row]
+
+
+def _clean_table(raw_rows: list[list[Any]], *, min_data_rows: int = MIN_DATA_ROWS) -> str | None:
     rows = _normalise_rows(raw_rows)
     rows = [r for r in rows if any(c for c in r)]
     if not rows:
@@ -191,7 +250,7 @@ def _clean_table(raw_rows: list[list[Any]]) -> str | None:
     rows = _drop_empty_columns(rows)
     rows = _merge_exclusive_columns(rows)
     rows = _drop_empty_columns(rows)
-    if not _looks_like_real_table(rows):
+    if not _looks_like_real_table(rows, min_data_rows=min_data_rows):
         return None
     return _table_to_markdown(rows)
 
@@ -278,10 +337,28 @@ def _format_band(page: Any, top: float, bottom: float, body_size: float) -> str:
     return "\n".join(out).strip()
 
 
-def _convert_page(
+# A table whose bbox sits within this many points of the page's top or
+# bottom edge is treated as a possible page-break continuation. Generous
+# enough to cover typical page margins without letting a table that merely
+# happens to be first/last on an otherwise text-heavy page qualify.
+_EDGE_TOLERANCE = 100.0
+
+
+def _convert_page_parts(
     page: Any,
     image_markers: list[tuple[float, str]] = (),
-) -> str:
+) -> tuple[list[str], TableEdge | None, TableEdge | None]:
+    """Render one page into an ordered list of markdown chunks, plus — when
+    applicable — the raw rows of a table touching the page's top or bottom
+    edge, so the caller can try to reunite it with its continuation on the
+    adjacent page before finalizing the markdown.
+
+    ``leading`` is only set when the topmost chunk on the page is a table
+    close to the top edge — i.e. nothing (no heading, no paragraph) precedes
+    it, which is exactly the shape a page-break-interrupted table takes on
+    the page where it resumes. ``trailing`` mirrors this for the bottom edge.
+    A table that is both (it fills the whole page) gets both.
+    """
     body_size = _body_font_size(page)
 
     try:
@@ -289,16 +366,50 @@ def _convert_page(
     except Exception:
         tables = []
 
-    accepted: list[tuple[tuple[float, float, float, float], str]] = []
-    for t in tables:
-        md = _clean_table(t.extract() or [])
-        if md:
-            accepted.append((t.bbox, md))
+    page_bottom = float(page.height)
 
-    accepted.sort(key=lambda x: x[0][1])
+    # Raw (pre-clean) rows for every detected table, sorted by top position.
+    # A short leftover fragment — just the last row or two of a table cut off
+    # by the page break, or just its header with the data starting on the
+    # next page — routinely fails `_looks_like_real_table`'s row-count floor
+    # on its own. Checked here, before any filtering, so such a fragment is
+    # never invisible to the edge/merge detection below purely because it
+    # looked too small to stand alone.
+    raw_tables: list[tuple[tuple[float, float, float, float], list[list[Any]], tuple[float, ...] | None]] = []
+    for t in tables:
+        raw_rows = t.extract() or []
+        if raw_rows:
+            raw_tables.append((t.bbox, raw_rows, _column_bounds(t)))
+    raw_tables.sort(key=lambda x: x[0][1])
+
+    # Index of the topmost / bottommost raw table, but only when it actually
+    # sits at the page edge — this is what makes it a page-break-continuation
+    # candidate rather than just an ordinary table that happens to be first
+    # or last among several on an otherwise normal page.
+    edge_leading_idx = 0 if raw_tables and raw_tables[0][0][1] <= _EDGE_TOLERANCE else None
+    edge_trailing_idx = (
+        len(raw_tables) - 1
+        if raw_tables and page_bottom - raw_tables[-1][0][3] <= _EDGE_TOLERANCE
+        else None
+    )
+
+    accepted: list[tuple[tuple[float, float, float, float], str, list[list[Any]], tuple[float, ...] | None, int]] = []
+    for i, (bbox, raw_rows, cols) in enumerate(raw_tables):
+        md = _clean_table(raw_rows)
+        if md is None and i in (edge_leading_idx, edge_trailing_idx):
+            # Relax only the row-count floor — a fragment this small is only
+            # trusted here because pdfplumber's ruling-line detection already
+            # vouches for it being a real table, and it sits exactly where a
+            # split table's edge would. The long-cell-ratio guard still
+            # applies, so a genuinely non-tabular bordered box at the page
+            # edge is not swept in by this.
+            md = _clean_table(raw_rows, min_data_rows=0)
+        if md:
+            accepted.append((bbox, md, raw_rows, cols, i))
 
     if not accepted and not image_markers:
-        return _format_band(page, 0.0, float(page.height), body_size)
+        band = _format_band(page, 0.0, float(page.height), body_size)
+        return ([band] if band else []), None, None
 
     # Tables advance the cursor past their bbox (text inside the table is
     # captured by the table itself). Image markers are zero-height anchors
@@ -306,25 +417,24 @@ def _convert_page(
     # surrounding bands, since the image lives on top of the text layer.
     # Ties at the same y put tables first so a table's contents aren't
     # split by an image that happens to sit on its border.
-    obstacles: list[tuple[float, float, str, bool]] = [
-        (bbox[1], bbox[3], md, True) for bbox, md in accepted
+    obstacles: list[tuple[float, float, str, bool, int]] = [
+        (bbox[1], bbox[3], md, True, i) for i, (bbox, md, _raw, _cols, _raw_idx) in enumerate(accepted)
     ]
     obstacles.extend(
-        (float(y), float(y), placeholder, False)
+        (float(y), float(y), placeholder, False, -1)
         for y, placeholder in image_markers
     )
     obstacles.sort(key=lambda o: (o[0], 0 if o[3] else 1))
 
-    chunks: list[tuple[float, str]] = []
+    chunks: list[tuple[float, str, int]] = []
     cursor = 0.0
-    page_bottom = float(page.height)
 
-    for top, bottom, md, is_table in obstacles:
+    for top, bottom, md, is_table, idx in obstacles:
         if top > cursor:
             band = _format_band(page, cursor, top, body_size)
             if band:
-                chunks.append((cursor, band))
-        chunks.append((top, md))
+                chunks.append((cursor, band, -1))
+        chunks.append((top, md, idx if is_table else -1))
         if is_table:
             cursor = bottom
         else:
@@ -339,10 +449,23 @@ def _convert_page(
     if cursor < page_bottom:
         band = _format_band(page, cursor, page_bottom, body_size)
         if band:
-            chunks.append((cursor, band))
+            chunks.append((cursor, band, -1))
 
     chunks.sort(key=lambda c: c[0])
-    return "\n\n".join(c[1] for c in chunks)
+
+    leading: TableEdge | None = None
+    trailing: TableEdge | None = None
+    if chunks:
+        _, _text, first_idx = chunks[0]
+        if first_idx >= 0 and accepted[first_idx][4] == edge_leading_idx:
+            _bbox, _md, raw_rows, cols, _raw_idx = accepted[first_idx]
+            leading = TableEdge(raw_rows, cols)
+        _, _text, last_idx = chunks[-1]
+        if last_idx >= 0 and accepted[last_idx][4] == edge_trailing_idx:
+            _bbox, _md, raw_rows, cols, _raw_idx = accepted[last_idx]
+            trailing = TableEdge(raw_rows, cols)
+
+    return [c[1] for c in chunks], leading, trailing
 
 
 class PdfPlumberTableConverter(DocumentConverter):
@@ -388,17 +511,51 @@ class PdfPlumberTableConverter(DocumentConverter):
                 image_markers_by_page = {}
 
         try:
-            page_chunks: list[str] = []
+            page_chunk_lists: list[list[str]] = []
+            pending_rows: list[list[Any]] | None = None
+            pending_bounds: tuple[float, ...] | None = None
             with pdfplumber.open(pdf_bytes) as pdf:
                 for page_index, page in enumerate(pdf.pages):
                     markers = image_markers_by_page.get(page_index, [])
                     try:
-                        page_md = _convert_page(page, markers)
+                        chunks, leading, trailing = _convert_page_parts(page, markers)
                     except Exception:
-                        page_md = (page.extract_text() or "").strip()
-                    if page_md.strip():
-                        page_chunks.append(page_md)
+                        text = (page.extract_text() or "").strip()
+                        chunks, leading, trailing = ([text] if text else []), None, None
+
+                    carried_forward = False
+                    if (
+                        pending_rows is not None
+                        and leading is not None
+                        and _bounds_match(pending_bounds, leading.col_bounds)
+                        and not _starts_with_header_row(
+                            leading.raw_rows, pending_rows[0] if pending_rows else None
+                        )
+                    ):
+                        combined_rows = pending_rows + leading.raw_rows
+                        merged_md = _clean_table(combined_rows)
+                        if merged_md:
+                            if page_chunk_lists and page_chunk_lists[-1]:
+                                page_chunk_lists[-1][-1] = merged_md
+                            chunks = chunks[1:]
+                            # The continuation may itself run to the bottom of this
+                            # page (a table spanning 3+ pages) — carry the combined
+                            # rows forward so the next page can extend it further,
+                            # instead of treating this page's distinct-looking
+                            # trailing table as the start of a new pending table.
+                            if trailing is not None and leading.raw_rows is trailing.raw_rows:
+                                pending_rows, pending_bounds = combined_rows, leading.col_bounds
+                                carried_forward = True
+
+                    if not carried_forward:
+                        if trailing is not None:
+                            pending_rows, pending_bounds = trailing.raw_rows, trailing.col_bounds
+                        else:
+                            pending_rows, pending_bounds = None, None
+
+                    page_chunk_lists.append([c for c in chunks if c and c.strip()])
                     page.close()
+            page_chunks = ["\n\n".join(cl) for cl in page_chunk_lists if cl]
             markdown = "\n\n".join(page_chunks).strip()
         except Exception:
             pdf_bytes.seek(0)
