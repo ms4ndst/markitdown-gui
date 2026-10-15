@@ -377,6 +377,7 @@ class ConversionWorker(QObject):
                 # markdown linter and break tables of contents.
                 from .markdown_cleanup import (
                     apply_lint_fixes,
+                    fix_reference_tables,
                     strip_empty_headings,
                     strip_headers_footers,
                     strip_page_numbers,
@@ -443,6 +444,24 @@ class ConversionWorker(QObject):
                             f"  -> removed table of contents ({removed_toc} "
                             "line(s))"
                         )
+
+                # API reference tables (Field | Datatype | Size | Comment):
+                # name blank headers, canonicalise datatype casing, and
+                # surface anything that still looks wrong — unknown
+                # datatypes are usually typos in the source document.
+                text_content, ref_fixes, ref_warnings = fix_reference_tables(
+                    text_content
+                )
+                if ref_fixes:
+                    self.log.emit(
+                        f"  -> normalised {ref_fixes} reference table(s)"
+                    )
+                for warning in ref_warnings[:20]:
+                    self.log.emit(f"  ! {warning}")
+                if len(ref_warnings) > 20:
+                    self.log.emit(
+                        f"  ! ... and {len(ref_warnings) - 20} more table warning(s)"
+                    )
 
                 # Run the markdownlint auto-fix pass over the safely-fixable
                 # rules (MD009/MD010/MD012/MD018/MD022/MD026/MD029/MD031/

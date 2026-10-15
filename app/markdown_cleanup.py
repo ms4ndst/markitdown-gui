@@ -133,6 +133,10 @@ def strip_headers_footers(
             return False
         if stripped.startswith("#") or _LIST_ITEM_RE.match(line):
             return False
+        # Table rows legitimately repeat (delimiter rows, the same field in
+        # many endpoint tables); deleting them guts the tables.
+        if stripped.startswith("|"):
+            return False
         return True
 
     counts: dict[str, int] = {}
@@ -1131,6 +1135,128 @@ def fix_malformed_tables(text: str) -> tuple[str, int]:
             out.append("")
         i = j
     return "\n".join(out), repaired
+
+
+# --------------------------------------------------------------------------
+# API reference tables (Field | Datatype | Size | Comment)
+# --------------------------------------------------------------------------
+
+# Canonical casing for the closed set of datatypes reference tables use.
+_DATATYPES = {
+    t.lower(): t
+    for t in (
+        "String", "Int", "Short", "Byte", "Bool", "Decimal", "Numeric", "Float",
+        "Double", "Datetime", "DateTime", "Date", "Timestamp", "Byte[]", "Guid",
+        "Enum", "List of Strings",
+    )
+}
+_ENUM_TYPE_RE = re.compile(r"^[A-Z]\w*EnumType$")
+_SIZE_RE = re.compile(r"^(\d+(,\d+)?|max)$")
+_ENUM_VALUE_RE = re.compile(r"^-?\d+( - \d+)?$")
+
+
+def _split_row(line: str) -> list[str]:
+    body = line.strip()
+    body = body[1:] if body.startswith("|") else body
+    body = body[:-1] if body.endswith("|") and not body.endswith("\\|") else body
+    return [c.strip() for c in re.split(r"(?<!\\)\|", body)]
+
+
+def _format_rows(rows: list[list[str]]) -> list[str]:
+    widths = [max(3, *(len(r[c]) for r in rows)) for c in range(len(rows[0]))]
+
+    def fmt(r: list[str]) -> str:
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(r)) + " |"
+
+    return [fmt(rows[0]), "|" + "|".join("-" * (w + 2) for w in widths) + "|",
+            *(fmt(r) for r in rows[1:])]
+
+
+def _is_datatype(value: str) -> bool:
+    return value.lower() in _DATATYPES or bool(_ENUM_TYPE_RE.match(value))
+
+
+def fix_reference_tables(text: str) -> tuple[str, int, list[str]]:
+    """Normalise API reference tables and report what still looks wrong.
+
+    Applies only to tables that look like a field reference — a ``Datatype``
+    header in column 2, or (headerless) a column 2 made mostly of known
+    datatypes — plus headerless two-column enum tables:
+
+    * a blank header row gets ``Field | Datatype | [Size |] Comment`` or
+      ``Value | Comment``;
+    * datatypes in lowercase get their canonical casing (``string`` ->
+      ``String``);
+    * safety net for a dropped empty Size cell: a row whose Size holds text
+      and whose Comment is empty has the text moved to Comment. The converter
+      places cells by position, so this should never fire — each row it
+      changes is reported in the warnings, since it means a layout the
+      converter got wrong.
+
+    Returns ``(new_markdown, changes, warnings)``; warnings also list
+    datatypes outside the known set (usually typos in the source document).
+    """
+    lines = text.split("\n")
+    skip = _compute_skip_lines(lines)
+    out: list[str] = []
+    changes = 0
+    warnings: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if i in skip or not _TABLE_ROW_RE.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while j < n and j not in skip and _TABLE_ROW_RE.match(lines[j]):
+            j += 1
+        region = lines[i:j]
+        if not _is_valid_gfm_table(region):
+            out.extend(region)
+            i = j
+            continue
+        header = _split_row(region[0])
+        rows = [_split_row(r) for r in region[2:]]
+        width = len(header)
+        if any(len(r) != width for r in rows) or not rows:
+            out.extend(region)
+            i = j
+            continue
+
+        new_header = list(header)
+        col2 = [r[1] for r in rows if width > 1 and r[1]]
+        typed = bool(col2) and sum(_is_datatype(v) for v in col2) / len(col2) >= 0.5
+        if not any(header):
+            if typed and width == 4:
+                new_header = ["Field", "Datatype", "Size", "Comment"]
+            elif typed and width == 3:
+                new_header = ["Field", "Datatype", "Comment"]
+            elif width == 2 and all(_ENUM_VALUE_RE.match(r[0]) for r in rows if r[0]):
+                new_header = ["Value", "Comment"]
+        is_reference = width >= 3 and new_header[1] == "Datatype"
+
+        new_rows = [list(r) for r in rows]
+        if is_reference:
+            sized = width == 4 and new_header[2] == "Size"
+            for k, r in enumerate(new_rows):
+                if r[1].lower() in _DATATYPES and r[1][:1].islower():
+                    r[1] = _DATATYPES[r[1].lower()]
+                elif r[1] and not _is_datatype(r[1]):
+                    warnings.append(f"unknown datatype {r[1]!r} for field {r[0]!r}")
+                if sized and r[2] and not r[3] and not _SIZE_RE.match(r[2]):
+                    warnings.append(
+                        f"moved {r[2]!r} from Size to Comment for field {r[0]!r} "
+                        "(converter placed it in the wrong column)"
+                    )
+                    r[2], r[3] = "", r[2]
+
+        if new_header != header or new_rows != rows:
+            changes += 1
+            out.extend(_format_rows([new_header, *new_rows]))
+        else:
+            out.extend(region)
+        i = j
+    return "\n".join(out), changes, warnings
 
 
 # The fix order is load-bearing:

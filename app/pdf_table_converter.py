@@ -5,28 +5,35 @@ Strategy
 1. Detect tables with ``vertical_strategy="lines"`` and
    ``horizontal_strategy="lines"`` only — never trust text alignment, which
    produces phantom columns on PDFs with zebra-striped row backgrounds.
-2. Post-process every detected table:
-   * merge alternating "zebra" row pairs whose non-empty cells are
-     complementary (PDFs with row shading frequently double the row count),
-   * drop columns that are empty across every row,
-   * reject the "table" if it ends up with fewer than two columns or two
-     data rows — those are bordered text boxes, not tables.
-3. Render text per vertical band (above / between / below tables) so
-   paragraphs keep their reading order.
-4. If detection fails or no tables survive, fall back to plain pdfminer text
-   for the whole document — never silently emit a broken table.
-5. A wide/tall table that gets cut off by a page break is reunited with its
-   continuation on the next page (see ``_bounds_match`` / the merge loop in
-   ``PdfPlumberTableConverter.convert``) instead of being emitted as two
-   separate, truncated-looking tables — or, worse, silently dropped when the
-   continuation alone fails the "looks like a real table" heuristics.
+2. Build every table's cells *by position*, not by pdfplumber's per-cell
+   text extraction (see ``_positional_table``):
+   * the true column separators are the ruling edges every multi-cell row
+     shares, minus any edge that cuts through a word — decorative sub-rules
+     inside a header row are not columns,
+   * each whole word is placed in the column containing its horizontal
+     centre, so a word is never cut in two (``D | atatype``) and a column
+     with no text stays an empty cell instead of letting the text to its
+     right slide left into it.
+3. A row whose every glyph is bold is the table's header. A table without
+   one (a page-break continuation, or a table the source never gave a
+   header) is emitted with a blank header row — a data row is never
+   promoted to header position.
+4. A table cut off by a page break is reunited with its headerless
+   continuation on the next page when both share the same column grid.
+5. Text outside tables is rendered after all pages are parsed, so heading
+   levels come from one document-wide body font size instead of each page's
+   own mix of fonts. Wrapped heading and paragraph lines are joined.
+6. If detection fails, fall back to plain pdfminer text for the whole
+   document — never silently emit a broken table.
 """
 
 from __future__ import annotations
 
 import io
+import re
 from collections import Counter
-from typing import Any, BinaryIO, NamedTuple
+from dataclasses import dataclass, field
+from typing import Any, BinaryIO, Union
 
 from markitdown import (
     DocumentConverter,
@@ -52,7 +59,24 @@ TABLE_SETTINGS_STRICT: dict[str, Any] = {
 }
 
 MIN_COLUMNS = 2
-MIN_DATA_ROWS = 1  # data rows below the header
+
+# Two ruling edges closer than this (points) are the same edge.
+_EDGE_TOL = 1.5
+
+# A table whose bbox sits within this many points of the page's top or
+# bottom edge is treated as a possible page-break continuation. Generous
+# enough to cover typical page margins without letting a table that merely
+# happens to be first/last on an otherwise text-heavy page qualify.
+_EDGE_TOLERANCE = 100.0
+
+# "Get method : /api/..." — an endpoint title in API reference documents.
+# Always an H2, whatever font the PDF gives it, and the paragraph right after
+# it (the endpoint description) is its H3.
+_METHOD_RE = re.compile(r"^(Get|Post|Put|Patch|Delete) method ?: ?/api/", re.IGNORECASE)
+# Dot-leader table-of-contents entry: never a heading, never joined.
+_TOC_LINE_RE = re.compile(r"(?:\.\s*){4,}\d{1,6}\s*$")
+_LIST_START_RE = re.compile(r"^\s*(?:\d+[.)]|[-*+•‣◦▪●○])\s")
+_BOLD_RE = re.compile(r"bold|black|heavy|semibold", re.IGNORECASE)
 
 
 def _cell(value: Any) -> str:
@@ -62,56 +86,171 @@ def _cell(value: Any) -> str:
     return text.replace("|", "\\|")
 
 
-def _normalise_rows(rows: list[list[Any]]) -> list[list[str]]:
-    if not rows:
-        return []
-    width = max(len(r) for r in rows)
-    return [[_cell(c) for c in row] + [""] * (width - len(row)) for row in rows]
+# --------------------------------------------------------------------------
+# Tables
+# --------------------------------------------------------------------------
 
 
-def _drop_empty_columns(rows: list[list[str]]) -> list[list[str]]:
-    if not rows:
-        return rows
-    width = len(rows[0])
-    keep = [c for c in range(width)
-            if any(rows[r][c] for r in range(len(rows)))]
-    return [[row[c] for c in keep] for row in rows]
+@dataclass
+class _Table:
+    """A table under assembly. ``rows`` keeps every positional column (empty
+    ones included) until rendering, so a page-break continuation can be
+    appended column-for-column."""
+
+    rows: list[list[str]]
+    bounds: tuple[float, ...]
+    has_header: bool
 
 
-def _merge_exclusive_columns(rows: list[list[str]]) -> list[list[str]]:
-    """Merge adjacent column pairs that are mutually exclusive per row.
+def _shared_edges(edge_sets: list[list[float]]) -> list[float]:
+    """Edges present (within ``_EDGE_TOL``) in every one of ``edge_sets``."""
+    shared: list[float] = []
+    for x in sorted(edge_sets[0]):  # a cell's x1 is its neighbour's x0
+        if not shared or x - shared[-1] > _EDGE_TOL:
+            shared.append(x)
+    for edges in edge_sets[1:]:
+        shared = [x for x in shared if any(abs(x - y) <= _EDGE_TOL for y in edges)]
+    return shared
 
-    pdfplumber sometimes detects two columns where the source has only one,
-    because header cells are slightly indented relative to data cells. The
-    symptom: a row never fills both column ``c`` and ``c+1``. Repeatedly merge
-    such pairs until no more can be merged.
+
+def _positional_table(page: Any, table: Any) -> _Table | None:
+    """Rebuild ``table`` from word positions.
+
+    pdfplumber derives its cell grid from every ruling line, including
+    decorative sub-rules drawn only inside a header row, and reports a cell
+    spanning several grid columns as text in the first one plus ``None``s.
+    Indexing that grid by position puts an empty cell's neighbour into it;
+    cutting text at each grid line splits words that a sub-rule crosses.
+    Assigning whole words to real columns by x-position avoids both.
     """
+    try:
+        rows = table.rows
+    except Exception:
+        return None
     if not rows:
-        return rows
+        return None
 
-    width = len(rows[0])
-    if width < 2:
-        return rows
+    edge_sets: list[list[float]] = []
+    for row in rows:
+        cells = [c for c in row.cells if c is not None]
+        if len(cells) >= 2:
+            edge_sets.append([x for c in cells for x in (c[0], c[2])])
+    if not edge_sets:
+        return None
+    seps = _shared_edges(edge_sets)
+    if len(seps) < 3:  # fewer than two columns
+        return None
 
-    changed = True
-    while changed and len(rows[0]) > 1:
-        changed = False
-        width = len(rows[0])
-        for c in range(width - 1):
-            both_filled = sum(
-                1 for r in rows if r[c] and r[c + 1]
-            )
-            either_filled = sum(
-                1 for r in rows if r[c] or r[c + 1]
-            )
-            if either_filled >= 2 and both_filled == 0:
-                rows = [
-                    r[:c] + [r[c] or r[c + 1]] + r[c + 2:]
-                    for r in rows
-                ]
-                changed = True
-                break
-    return rows
+    x0, top, x1, bottom = table.bbox
+    try:
+        words = page.crop((x0, top, x1, bottom), strict=False).extract_words(
+            x_tolerance=3, y_tolerance=3, extra_attrs=["fontname", "non_stroking_color"]
+        )
+    except Exception:
+        return None
+
+    # An edge that runs through a word is a decorative rule, not a column
+    # boundary — it would otherwise cut "Size" into "S" | "ize".
+    inner = [
+        s for s in seps[1:-1]
+        if not any(w["x0"] < s - 1 and w["x1"] > s + 1 for w in words)
+    ]
+    seps = [seps[0], *inner, seps[-1]]
+    n_cols = len(seps) - 1
+    if n_cols < MIN_COLUMNS:
+        return None
+
+    def col_of(xc: float) -> int:
+        for c in range(n_cols):
+            if xc < seps[c + 1]:
+                return c
+        return n_cols - 1
+
+    row_bands = sorted({(round(r.bbox[1], 1), round(r.bbox[3], 1)) for r in rows})
+    grid: list[list[list[dict]]] = [[[] for _ in range(n_cols)] for _ in row_bands]
+    bold_flags: list[list[bool]] = [[] for _ in row_bands]
+    colors: list[list[str]] = [[] for _ in row_bands]
+    for w in words:
+        yc = (w["top"] + w["bottom"]) / 2
+        r = next((i for i, (t, b) in enumerate(row_bands) if t <= yc < b), None)
+        if r is None:
+            continue
+        grid[r][col_of((w["x0"] + w["x1"]) / 2)].append(w)
+        bold_flags[r].append(bool(_BOLD_RE.search(w.get("fontname") or "")))
+        colors[r].append(str(w.get("non_stroking_color")))
+
+    def cell_text(ws: list[dict]) -> str:
+        ws = sorted(ws, key=lambda w: (round(w["top"]), w["x0"]))
+        return _cell(" ".join(w["text"] for w in ws))
+
+    out_rows: list[list[str]] = []
+    out_bold: list[list[bool]] = []
+    out_colors: list[list[str]] = []
+    for r, cols in enumerate(grid):
+        row = [cell_text(ws) for ws in cols]
+        if any(row):
+            out_rows.append(row)
+            out_bold.append(bold_flags[r])
+            out_colors.append(colors[r])
+    if not out_rows:
+        return None
+
+    any_bold = any(any(f) for f in out_bold)
+    first_filled = sum(1 for c in out_rows[0] if c)
+    body_colors = Counter(c for cs in out_colors[1:] for c in cs)
+    head_colors = set(out_colors[0])
+    # Header text drawn in its own colour (white on a filled band) marks the
+    # header even when the font isn't bold.
+    colored_head = (
+        len(head_colors) == 1
+        and bool(body_colors)
+        and next(iter(head_colors)) != body_colors.most_common(1)[0][0]
+    )
+    if any_bold or colored_head:
+        # Data rows in reference tables often bold their first column, so
+        # only a row that is bold throughout counts as a header.
+        has_header = (all(out_bold[0]) or colored_head) and first_filled >= 2
+    else:
+        # No font cue at all: keep the conventional first-row-is-header.
+        has_header = first_filled >= 2
+
+    return _Table(out_rows, tuple(seps), has_header)
+
+
+def _continuation_map(prev: _Table, cont: _Table, tol: float = 3.0) -> list[int] | None:
+    """Map each of ``cont``'s columns onto ``prev``'s, or ``None`` when
+    ``cont`` does not continue ``prev``.
+
+    The two fragments of a page-split table rarely share an identical grid:
+    a fragment holding only the header row carries the header's decorative
+    sub-rules, the other fragment only the real column rules. So the outer
+    edges must match, and every column of ``cont`` that holds text must land
+    — by its centre — in a distinct column of ``prev``, in the same order.
+    """
+    a, b = prev.bounds, cont.bounds
+    if abs(a[0] - b[0]) > tol or abs(a[-1] - b[-1]) > tol:
+        return None
+
+    def col_of(x: float) -> int:
+        for c in range(len(a) - 1):
+            if x < a[c + 1]:
+                return c
+        return len(a) - 2
+
+    mapping = [col_of((b[c] + b[c + 1]) / 2) for c in range(len(b) - 1)]
+    filled = [mapping[c] for c in range(len(b) - 1) if any(r[c] for r in cont.rows)]
+    if any(x >= y for x, y in zip(filled, filled[1:])):
+        return None
+    return mapping
+
+
+def _append_rows(prev: _Table, cont: _Table, mapping: list[int]) -> None:
+    for row in cont.rows:
+        new = [""] * (len(prev.bounds) - 1)
+        for c, text in enumerate(row):
+            if text:
+                new[mapping[c]] = f"{new[mapping[c]]} {text}".strip()
+        prev.rows.append(new)
 
 
 def _merge_zebra_rows(rows: list[list[str]]) -> list[list[str]]:
@@ -154,127 +293,74 @@ def _merge_zebra_rows(rows: list[list[str]]) -> list[list[str]]:
     return merged
 
 
-def _looks_like_real_table(rows: list[list[str]], *, min_data_rows: int = MIN_DATA_ROWS) -> bool:
-    if len(rows) < 1 + min_data_rows:
+def _looks_like_real_table(t: _Table) -> bool:
+    """Reject bordered text boxes: one real column, or mostly long prose."""
+    filled_cols = sum(1 for c in range(len(t.bounds) - 1) if any(r[c] for r in t.rows))
+    if filled_cols < MIN_COLUMNS:
         return False
-    if not rows[0] or len(rows[0]) < MIN_COLUMNS:
-        return False
-
-    non_empty = [c for r in rows for c in r if c]
-    if not non_empty:
-        return False
+    non_empty = [c for r in t.rows for c in r if c]
     long_cells = sum(1 for c in non_empty if len(c) > 120)
-    if long_cells / len(non_empty) > 0.3:
-        return False
-    return True
+    return long_cells / len(non_empty) <= 0.3
 
 
-def _table_to_markdown(rows: list[list[str]]) -> str:
-    if not rows:
-        return ""
-    width = len(rows[0])
-    col_widths = [max(3, max(len(r[c]) for r in rows)) for c in range(width)]
+def _render_table(t: _Table) -> str:
+    rows = t.rows
+    if t.has_header:
+        header, body = rows[0], rows[1:]
+    else:
+        header, body = [""] * len(rows[0]), rows
+    body = _merge_zebra_rows(body) if body else body
+    all_rows = [header, *body]
+    keep = [c for c in range(len(header)) if any(r[c] for r in all_rows)]
+    all_rows = [[r[c] for c in keep] for r in all_rows]
+    widths = [max(3, max(len(r[c]) for r in all_rows)) for c in range(len(keep))]
 
     def fmt(row: list[str]) -> str:
-        return "| " + " | ".join(c.ljust(col_widths[i]) for i, c in enumerate(row)) + " |"
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(row)) + " |"
 
-    header, *rest = rows
-    lines = [fmt(header), "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"]
-    lines.extend(fmt(r) for r in rest)
+    lines = [fmt(all_rows[0]), "|" + "|".join("-" * (w + 2) for w in widths) + "|"]
+    lines.extend(fmt(r) for r in all_rows[1:])
     return "\n".join(lines)
 
 
-class TableEdge(NamedTuple):
-    """A table touching the very top or bottom of a page — a candidate to be
-    reunited with its continuation on the adjacent page."""
-
-    raw_rows: list[list[Any]]
-    col_bounds: tuple[float, ...] | None
+# --------------------------------------------------------------------------
+# Text
+# --------------------------------------------------------------------------
 
 
-def _column_bounds(t: Any) -> tuple[float, ...] | None:
-    """Left-edge x-position of every column, read from the table's own ruling
-    lines via its first row's cells. Two tables sharing the same column grid
-    are strong evidence they are the same source table split by a page break
-    — pdfplumber places both at identical x-coordinates since it derives them
-    from the PDF's ruling lines, which repeat unchanged across pages for a
-    single continued table.
-    """
+@dataclass
+class _Line:
+    text: str
+    top: float
+    bottom: float
+    size: float
+
+
+@dataclass
+class _TextBlock:
+    lines: list[_Line] = field(default_factory=list)
+
+
+_Item = Union[_TextBlock, _Table, str]  # str = image placeholder
+
+
+def _band_lines(page: Any, top: float, bottom: float) -> list[_Line]:
+    if bottom - top < 2:
+        return []
     try:
-        rows = t.rows
+        cropped = page.crop((0, top, page.width, bottom), strict=False)
+        raw = cropped.extract_text_lines(x_tolerance=2, y_tolerance=3)
     except Exception:
-        return None
-    if not rows:
-        return None
-    cells = rows[0].cells
-    bounds = [c[0] for c in cells if c is not None]
-    if len(bounds) < 2:
-        return None
-    return tuple(round(b, 1) for b in bounds)
-
-
-def _bounds_match(a: tuple[float, ...] | None, b: tuple[float, ...] | None, tol: float = 3.0) -> bool:
-    if a is None or b is None or len(a) != len(b):
-        return False
-    return all(abs(x - y) <= tol for x, y in zip(a, b))
-
-
-def _starts_with_header_row(rows: list[list[Any]], header_row: list[Any] | None) -> bool:
-    """True when ``rows``' first row is identical to ``header_row``.
-
-    Used to *veto* a page-break merge, not to trust it: a genuine
-    continuation resumes with data, not a repeat of the header (documents in
-    the wild that reuse the same generic column template — "Field / Type /
-    Size / Comment" and the like — across many unrelated tables are common,
-    and on such a document, two distinct tables landing back-to-back across a
-    page break would otherwise look identical to one split table). A leading
-    fragment that opens with the exact header text is far more likely a new,
-    unrelated table that happens to share the template than a continuation
-    that repeats its header — so this blocks the merge rather than stripping
-    the row and proceeding.
-    """
-    if not rows or not header_row:
-        return False
-    return [_cell(c) for c in rows[0]] == [_cell(c) for c in header_row]
-
-
-def _clean_table(raw_rows: list[list[Any]], *, min_data_rows: int = MIN_DATA_ROWS) -> str | None:
-    rows = _normalise_rows(raw_rows)
-    rows = [r for r in rows if any(c for c in r)]
-    if not rows:
-        return None
-    rows = _drop_empty_columns(rows)
-    if not rows or not rows[0]:
-        return None
-    rows = _merge_zebra_rows(rows)
-    rows = _drop_empty_columns(rows)
-    rows = _merge_exclusive_columns(rows)
-    rows = _drop_empty_columns(rows)
-    if not _looks_like_real_table(rows, min_data_rows=min_data_rows):
-        return None
-    return _table_to_markdown(rows)
-
-
-def _body_font_size(page: Any) -> float:
-    """Modal char size on the page — used as the baseline for heading detection."""
-    chars = page.chars or []
-    if not chars:
-        return 0.0
-    sizes = Counter(round(c["size"], 1) for c in chars if c.get("size"))
-    if not sizes:
-        return 0.0
-    return float(sizes.most_common(1)[0][0])
-
-
-def _heading_level(ratio: float) -> int | None:
-    """Return a heading level (1-3) for a line whose font is ``ratio`` × body."""
-    if ratio >= 1.8:
-        return 1
-    if ratio >= 1.45:
-        return 2
-    if ratio >= 1.2:
-        return 3
-    return None
+        return []
+    out: list[_Line] = []
+    for line in raw:
+        text = (line.get("text") or "").strip()
+        if not text:
+            continue
+        sizes = [c["size"] for c in (line.get("chars") or []) if c.get("size")]
+        size = sum(sizes) / len(sizes) if sizes else 0.0
+        out.append(_Line(text, float(line["top"]), float(line["bottom"]), size))
+    return out
 
 
 def _is_heading_worthy(text: str) -> bool:
@@ -286,130 +372,136 @@ def _is_heading_worthy(text: str) -> bool:
     alpha = sum(1 for c in text if c.isalpha())
     if alpha < 3:
         return False
-    if "|" in text:
+    if "|" in text or _TOC_LINE_RE.search(text):
         return False
     return True
 
 
-def _format_band(page: Any, top: float, bottom: float, body_size: float) -> str:
-    """Extract a vertical slice of the page, promoting larger-font lines to
-    Markdown headings based on font-size ratio against ``body_size``.
+def _is_footer_noise(text: str) -> bool:
+    """True for a bare page number or other decorative running header/footer
+    line. Used to look past such boilerplate when deciding whether an
+    edge-touching table is truly the first/last meaningful content on the
+    page: a page number sitting next to a table that was cut off by the page
+    break must not stop it from being recognized as a continuation.
     """
-    if bottom - top < 2:
-        return ""
-    try:
-        cropped = page.crop((0, top, page.width, bottom), strict=False)
-    except Exception:
-        return ""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return sum(1 for c in stripped if c.isalpha()) < 3
 
-    try:
-        text_lines = cropped.extract_text_lines(x_tolerance=2, y_tolerance=3)
-    except Exception:
-        text = cropped.extract_text(x_tolerance=2, y_tolerance=3) or ""
-        return text.strip()
 
-    if not text_lines:
-        return ""
+def _heading_level(size: float, body: float) -> int | None:
+    """Heading level for a line ``size`` points tall, against the document's
+    body size. Two size tiers only: document titles (H1) and section /
+    endpoint titles (H2); H3 is reserved for the endpoint description rule
+    in :func:`_render_text`, which no font size can express reliably."""
+    if body <= 0 or size <= 0:
+        return None
+    ratio = size / body
+    if ratio >= 1.6:
+        return 1
+    if ratio >= 1.05:
+        return 2
+    return None
+
+
+def _render_text(lines: list[_Line], body: float) -> str:
+    """Render one band of text lines: assign heading levels, then join lines
+    that wrapped — consecutive lines of the same kind with only line spacing
+    between them form one heading or one paragraph."""
+    blocks: list[list[Any]] = []  # [level or 0, text, last_line]
+    # Endpoint description: the paragraph right after a method title.
+    # "expect" = the next line starts it; "inside" = wrapped lines join it.
+    desc = "none"
+    for ln in lines:
+        text = ln.text
+        prev = blocks[-1] if blocks else None
+        gap = ln.top - prev[2].bottom if prev else None
+        tight = gap is not None and gap <= 0.45 * max(ln.size, prev[2].size, 1.0)
+        is_method = bool(_METHOD_RE.match(text)) and not _TOC_LINE_RE.search(text)
+        unjoinable = (
+            prev is None
+            or bool(_TOC_LINE_RE.search(text) or _TOC_LINE_RE.search(prev[1]))
+            or _is_footer_noise(text)
+            or _is_footer_noise(prev[1])
+            or bool(_LIST_START_RE.match(text))
+            or is_method
+        )
+
+        if is_method:
+            blocks.append([2, text, ln])
+            desc = "expect"
+            continue
+        if desc == "expect" and ln.size <= body * 1.04 and not _is_footer_noise(text):
+            blocks.append([3, text, ln])
+            desc = "inside"
+            continue
+        if desc == "inside" and tight and not unjoinable:
+            prev[1] = f"{prev[1]} {text}"
+            prev[2] = ln
+            continue
+        desc = "none"
+
+        level = None
+        if len(text) <= 120 and _is_heading_worthy(text):
+            level = _heading_level(ln.size, body)
+        lvl = level or 0
+        # Wrapped lines: same kind, only line spacing between them. A heading
+        # line starting in lowercase continues the heading above it, and
+        # stacked title lines (title + version on a cover page) are one H1.
+        if (
+            not unjoinable
+            and prev[0] == lvl
+            and lvl != 3
+            and (tight or (lvl and text[:1].islower()) or lvl == 1)
+        ):
+            prev[1] = f"{prev[1]} {text}"
+            prev[2] = ln
+        else:
+            blocks.append([lvl, text, ln])
 
     out: list[str] = []
-    for line in text_lines:
-        text = (line.get("text") or "").strip()
-        if not text:
-            continue
-
-        level: int | None = None
-        if body_size > 0 and len(text) <= 120:
-            line_chars = line.get("chars") or []
-            if line_chars:
-                avg = sum(c["size"] for c in line_chars if c.get("size")) / max(
-                    1, sum(1 for c in line_chars if c.get("size"))
-                )
-                if avg:
-                    level = _heading_level(avg / body_size)
-
-        if level is not None and _is_heading_worthy(text):
-            out.append("")
-            out.append(f"{'#' * level} {text}")
-            out.append("")
-        else:
-            out.append(text)
-
-    return "\n".join(out).strip()
+    for lvl, text, _ in blocks:
+        out.append(f"{'#' * lvl} {text}" if lvl else text)
+    return "\n\n".join(out).strip()
 
 
-# A table whose bbox sits within this many points of the page's top or
-# bottom edge is treated as a possible page-break continuation. Generous
-# enough to cover typical page margins without letting a table that merely
-# happens to be first/last on an otherwise text-heavy page qualify.
-_EDGE_TOLERANCE = 100.0
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
 
 
-def _convert_page_parts(
+@dataclass
+class _Page:
+    items: list[_Item]
+    leading: _Table | None
+    trailing: _Table | None
+
+
+def _parse_page(
     page: Any,
     image_markers: list[tuple[float, str]] = (),
-) -> tuple[list[str], TableEdge | None, TableEdge | None]:
-    """Render one page into an ordered list of markdown chunks, plus — when
-    applicable — the raw rows of a table touching the page's top or bottom
-    edge, so the caller can try to reunite it with its continuation on the
-    adjacent page before finalizing the markdown.
+    furniture: frozenset[str] = frozenset(),
+) -> _Page:
+    """Split one page into vertically ordered text blocks, tables and image
+    placeholders, and note a table touching the page's top or bottom edge —
+    a candidate to be joined with its neighbour across the page break.
 
-    ``leading`` is only set when the topmost chunk on the page is a table
-    close to the top edge — i.e. nothing (no heading, no paragraph) precedes
-    it, which is exactly the shape a page-break-interrupted table takes on
-    the page where it resumes. ``trailing`` mirrors this for the bottom edge.
-    A table that is both (it fills the whole page) gets both.
-    """
-    body_size = _body_font_size(page)
-
+    ``furniture`` holds image placeholders that repeat on many pages (a logo
+    in the footer); like a page number, they never count as the content
+    that separates a table from the page edge."""
     try:
-        tables = page.find_tables(TABLE_SETTINGS_STRICT) or []
+        found = page.find_tables(TABLE_SETTINGS_STRICT) or []
     except Exception:
-        tables = []
+        found = []
 
     page_bottom = float(page.height)
-
-    # Raw (pre-clean) rows for every detected table, sorted by top position.
-    # A short leftover fragment — just the last row or two of a table cut off
-    # by the page break, or just its header with the data starting on the
-    # next page — routinely fails `_looks_like_real_table`'s row-count floor
-    # on its own. Checked here, before any filtering, so such a fragment is
-    # never invisible to the edge/merge detection below purely because it
-    # looked too small to stand alone.
-    raw_tables: list[tuple[tuple[float, float, float, float], list[list[Any]], tuple[float, ...] | None]] = []
-    for t in tables:
-        raw_rows = t.extract() or []
-        if raw_rows:
-            raw_tables.append((t.bbox, raw_rows, _column_bounds(t)))
-    raw_tables.sort(key=lambda x: x[0][1])
-
-    # Index of the topmost / bottommost raw table, but only when it actually
-    # sits at the page edge — this is what makes it a page-break-continuation
-    # candidate rather than just an ordinary table that happens to be first
-    # or last among several on an otherwise normal page.
-    edge_leading_idx = 0 if raw_tables and raw_tables[0][0][1] <= _EDGE_TOLERANCE else None
-    edge_trailing_idx = (
-        len(raw_tables) - 1
-        if raw_tables and page_bottom - raw_tables[-1][0][3] <= _EDGE_TOLERANCE
-        else None
-    )
-
-    accepted: list[tuple[tuple[float, float, float, float], str, list[list[Any]], tuple[float, ...] | None, int]] = []
-    for i, (bbox, raw_rows, cols) in enumerate(raw_tables):
-        md = _clean_table(raw_rows)
-        if md is None and i in (edge_leading_idx, edge_trailing_idx):
-            # Relax only the row-count floor — a fragment this small is only
-            # trusted here because pdfplumber's ruling-line detection already
-            # vouches for it being a real table, and it sits exactly where a
-            # split table's edge would. The long-cell-ratio guard still
-            # applies, so a genuinely non-tabular bordered box at the page
-            # edge is not swept in by this.
-            md = _clean_table(raw_rows, min_data_rows=0)
-        if md:
-            accepted.append((bbox, md, raw_rows, cols, i))
-
-    if not accepted and not image_markers:
-        band = _format_band(page, 0.0, float(page.height), body_size)
-        return ([band] if band else []), None, None
+    tables: list[tuple[tuple[float, float, float, float], _Table]] = []
+    for t in found:
+        pt = _positional_table(page, t)
+        if pt is not None and _looks_like_real_table(pt):
+            tables.append((t.bbox, pt))
+    tables.sort(key=lambda x: x[0][1])
 
     # Tables advance the cursor past their bbox (text inside the table is
     # captured by the table itself). Image markers are zero-height anchors
@@ -417,55 +509,89 @@ def _convert_page_parts(
     # surrounding bands, since the image lives on top of the text layer.
     # Ties at the same y put tables first so a table's contents aren't
     # split by an image that happens to sit on its border.
-    obstacles: list[tuple[float, float, str, bool, int]] = [
-        (bbox[1], bbox[3], md, True, i) for i, (bbox, md, _raw, _cols, _raw_idx) in enumerate(accepted)
-    ]
-    obstacles.extend(
-        (float(y), float(y), placeholder, False, -1)
-        for y, placeholder in image_markers
-    )
-    obstacles.sort(key=lambda o: (o[0], 0 if o[3] else 1))
+    obstacles: list[tuple[float, float, _Item]] = [(b[1], b[3], t) for b, t in tables]
+    obstacles.extend((float(y), float(y), ph) for y, ph in image_markers)
+    obstacles.sort(key=lambda o: (o[0], 0 if isinstance(o[2], _Table) else 1))
 
-    chunks: list[tuple[float, str, int]] = []
+    items: list[tuple[float, _Item]] = []
     cursor = 0.0
-
-    for top, bottom, md, is_table, idx in obstacles:
+    for top, bottom, obj in obstacles:
         if top > cursor:
-            band = _format_band(page, cursor, top, body_size)
-            if band:
-                chunks.append((cursor, band, -1))
-        chunks.append((top, md, idx if is_table else -1))
-        if is_table:
-            cursor = bottom
-        else:
-            # Image marker is zero-height. Advance cursor to its top so the
-            # next band starts there — text inside the image's bbox is
-            # captured by that next band (the image sits on top of the
-            # text layer, not in place of it). Without this, the next band
-            # would re-extract everything from the previous cursor and
-            # duplicate text we already emitted.
-            cursor = max(cursor, top)
-
+            lines = _band_lines(page, cursor, top)
+            if lines:
+                items.append((cursor, _TextBlock(lines)))
+        items.append((top, obj))
+        cursor = bottom if isinstance(obj, _Table) else max(cursor, top)
     if cursor < page_bottom:
-        band = _format_band(page, cursor, page_bottom, body_size)
-        if band:
-            chunks.append((cursor, band, -1))
+        lines = _band_lines(page, cursor, page_bottom)
+        if lines:
+            items.append((cursor, _TextBlock(lines)))
+    items.sort(key=lambda it: it[0])
 
-    chunks.sort(key=lambda c: c[0])
+    def meaningful(item: _Item) -> bool:
+        if isinstance(item, _TextBlock):
+            return not all(_is_footer_noise(ln.text) for ln in item.lines)
+        if isinstance(item, str):
+            return item not in furniture
+        return True
 
-    leading: TableEdge | None = None
-    trailing: TableEdge | None = None
-    if chunks:
-        _, _text, first_idx = chunks[0]
-        if first_idx >= 0 and accepted[first_idx][4] == edge_leading_idx:
-            _bbox, _md, raw_rows, cols, _raw_idx = accepted[first_idx]
-            leading = TableEdge(raw_rows, cols)
-        _, _text, last_idx = chunks[-1]
-        if last_idx >= 0 and accepted[last_idx][4] == edge_trailing_idx:
-            _bbox, _md, raw_rows, cols, _raw_idx = accepted[last_idx]
-            trailing = TableEdge(raw_rows, cols)
+    bbox_of = {id(t): b for b, t in tables}
+    leading = trailing = None
+    first = next((it for _, it in items if meaningful(it)), None)
+    last = next((it for _, it in reversed(items) if meaningful(it)), None)
+    if isinstance(first, _Table) and bbox_of[id(first)][1] <= _EDGE_TOLERANCE:
+        leading = first
+    if isinstance(last, _Table) and page_bottom - bbox_of[id(last)][3] <= _EDGE_TOLERANCE:
+        trailing = last
 
-    return [c[1] for c in chunks], leading, trailing
+    return _Page([it for _, it in items], leading, trailing)
+
+
+def _body_font_size(pages: list[_Page]) -> float:
+    """Modal font size, weighted by characters, of all text outside tables."""
+    sizes: Counter[float] = Counter()
+    for p in pages:
+        for item in p.items:
+            if isinstance(item, _TextBlock):
+                for ln in item.lines:
+                    if ln.size:
+                        sizes[round(ln.size, 1)] += len(ln.text)
+    return float(sizes.most_common(1)[0][0]) if sizes else 0.0
+
+
+def _join_page_breaks(pages: list[_Page]) -> None:
+    """Append each headerless continuation table to the table it continues on
+    the previous page, removing it from its own page. Runs in place."""
+    pending: _Table | None = None
+    for p in pages:
+        lead = p.leading
+        mapping = (
+            _continuation_map(pending, lead)
+            if pending is not None and lead is not None and not lead.has_header
+            else None
+        )
+        if mapping is not None:
+            _append_rows(pending, lead, mapping)
+            p.items = [it for it in p.items if it is not lead]
+            pending = pending if p.trailing is lead else p.trailing
+        else:
+            pending = p.trailing
+
+
+def _render_pages(pages: list[_Page]) -> str:
+    body = _body_font_size(pages)
+    chunks: list[str] = []
+    for p in pages:
+        for item in p.items:
+            if isinstance(item, _Table):
+                chunks.append(_render_table(item))
+            elif isinstance(item, _TextBlock):
+                text = _render_text(item.lines, body)
+                if text:
+                    chunks.append(text)
+            elif item and item.strip():
+                chunks.append(item)
+    return "\n\n".join(chunks).strip()
 
 
 class PdfPlumberTableConverter(DocumentConverter):
@@ -510,53 +636,26 @@ class PdfPlumberTableConverter(DocumentConverter):
             except Exception:
                 image_markers_by_page = {}
 
+        # An image placed on three or more pages is page furniture (a logo).
+        pages_per_marker = Counter(
+            ph for markers in image_markers_by_page.values() for ph in {p for _, p in markers}
+        )
+        furniture = frozenset(ph for ph, n in pages_per_marker.items() if n >= 3)
+
         try:
-            page_chunk_lists: list[list[str]] = []
-            pending_rows: list[list[Any]] | None = None
-            pending_bounds: tuple[float, ...] | None = None
+            pages: list[_Page] = []
             with pdfplumber.open(pdf_bytes) as pdf:
                 for page_index, page in enumerate(pdf.pages):
                     markers = image_markers_by_page.get(page_index, [])
                     try:
-                        chunks, leading, trailing = _convert_page_parts(page, markers)
+                        pages.append(_parse_page(page, markers, furniture))
                     except Exception:
                         text = (page.extract_text() or "").strip()
-                        chunks, leading, trailing = ([text] if text else []), None, None
-
-                    carried_forward = False
-                    if (
-                        pending_rows is not None
-                        and leading is not None
-                        and _bounds_match(pending_bounds, leading.col_bounds)
-                        and not _starts_with_header_row(
-                            leading.raw_rows, pending_rows[0] if pending_rows else None
-                        )
-                    ):
-                        combined_rows = pending_rows + leading.raw_rows
-                        merged_md = _clean_table(combined_rows)
-                        if merged_md:
-                            if page_chunk_lists and page_chunk_lists[-1]:
-                                page_chunk_lists[-1][-1] = merged_md
-                            chunks = chunks[1:]
-                            # The continuation may itself run to the bottom of this
-                            # page (a table spanning 3+ pages) — carry the combined
-                            # rows forward so the next page can extend it further,
-                            # instead of treating this page's distinct-looking
-                            # trailing table as the start of a new pending table.
-                            if trailing is not None and leading.raw_rows is trailing.raw_rows:
-                                pending_rows, pending_bounds = combined_rows, leading.col_bounds
-                                carried_forward = True
-
-                    if not carried_forward:
-                        if trailing is not None:
-                            pending_rows, pending_bounds = trailing.raw_rows, trailing.col_bounds
-                        else:
-                            pending_rows, pending_bounds = None, None
-
-                    page_chunk_lists.append([c for c in chunks if c and c.strip()])
+                        lines = [_Line(t, 0.0, 0.0, 0.0) for t in text.splitlines() if t.strip()]
+                        pages.append(_Page([_TextBlock(lines)] if lines else [], None, None))
                     page.close()
-            page_chunks = ["\n\n".join(cl) for cl in page_chunk_lists if cl]
-            markdown = "\n\n".join(page_chunks).strip()
+            _join_page_breaks(pages)
+            markdown = _render_pages(pages)
         except Exception:
             pdf_bytes.seek(0)
             markdown = pdfminer.high_level.extract_text(pdf_bytes)
