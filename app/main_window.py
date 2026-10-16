@@ -68,7 +68,13 @@ from .theme import (
     current_palette,
     refresh_widgets,
 )
-from .worker import ConversionItem, ConversionWorker, OcrConfig, run_in_thread
+from .worker import (
+    ConversionItem,
+    ConversionWorker,
+    OcrConfig,
+    run_in_thread,
+    stop_threads,
+)
 
 
 SCANNED_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -506,6 +512,20 @@ class MainWindow(QMainWindow):
             "paragraphs, tables and list items are left alone."
         )
 
+        self.normalize_headings_check = QCheckBox("Normalise heading structure")
+        self.normalize_headings_check.setChecked(True)
+        self.normalize_headings_check.setToolTip(
+            "Give every file one top-level heading and no skipped levels\n"
+            "(markdownlint MD025 / MD001):\n"
+            "  • a Word / Google Docs 'Title' paragraph becomes the # heading\n"
+            "    and Heading 1-5 move down one level;\n"
+            "  • a file with several # headings gets its name as the # heading\n"
+            "    and every heading moves down one level;\n"
+            "  • skipped levels (H1 -> H3) are closed up, keeping which headings\n"
+            "    are siblings and which are children.\n"
+            "Untick to keep the source document's heading levels as they are."
+        )
+
         self.strip_headers_footers_check = QCheckBox(
             "Strip headers/footers in PDFs/DOCX"
         )
@@ -529,6 +549,8 @@ class MainWindow(QMainWindow):
         general_row.addSpacing(20)
         general_row.addWidget(self.generate_index_check)
         general_row.addWidget(self.index_folders_button)
+        general_row.addSpacing(20)
+        general_row.addWidget(self.normalize_headings_check)
         general_row.addStretch(1)
         body_layout.addLayout(general_row)
 
@@ -648,7 +670,8 @@ class MainWindow(QMainWindow):
                    self.detect_tables_check, self.generate_index_check,
                    self.embed_images_check, self.extract_images_check,
                    self.strip_pagenumbers_check,
-                   self.strip_headers_footers_check, self.ocr_check):
+                   self.strip_headers_footers_check,
+                   self.normalize_headings_check, self.ocr_check):
             cb.toggled.connect(self._schedule_save)
         self.ocr_provider_combo.currentIndexChanged.connect(self._schedule_save)
         self.ocr_model_combo.currentTextChanged.connect(self._schedule_save)
@@ -672,6 +695,7 @@ class MainWindow(QMainWindow):
             "extract_images": self.extract_images_check.isChecked(),
             "strip_pagenumbers": self.strip_pagenumbers_check.isChecked(),
             "strip_headers_footers": self.strip_headers_footers_check.isChecked(),
+            "normalize_headings": self.normalize_headings_check.isChecked(),
             "index_excluded_folders": sorted(self._index_excluded),
             "gdrive": {
                 "folder_url": self.gdrive_url_edit.text(),
@@ -709,6 +733,7 @@ class MainWindow(QMainWindow):
             ("extract_images", self.extract_images_check),
             ("strip_pagenumbers", self.strip_pagenumbers_check),
             ("strip_headers_footers", self.strip_headers_footers_check),
+            ("normalize_headings", self.normalize_headings_check),
         ):
             if key in cfg:
                 widget.setChecked(bool(cfg[key]))
@@ -1313,6 +1338,13 @@ class MainWindow(QMainWindow):
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._persist_settings()
+        # A conversion still running would abort the process on exit
+        # ("QThread: Destroyed while thread is still running"). Cancel it and
+        # give the current file a moment; if it is stuck in a long call (an
+        # OCR request can take minutes), leave without tearing the thread
+        # down — settings are already saved, and only that file is lost.
+        if not stop_threads(5000):
+            os._exit(0)
         super().closeEvent(event)
 
     def _remove_selected(self) -> None:
@@ -1609,6 +1641,7 @@ class MainWindow(QMainWindow):
             extract_pdf_images=self.extract_images_check.isChecked(),
             strip_pdf_page_numbers=self.strip_pagenumbers_check.isChecked(),
             strip_pdf_headers_footers=self.strip_headers_footers_check.isChecked(),
+            normalize_headings=self.normalize_headings_check.isChecked(),
             ocr=OcrConfig(
                 enabled=self.ocr_check.isChecked(),
                 model=self.ocr_model_combo.currentText().strip() or "gpt-4o",

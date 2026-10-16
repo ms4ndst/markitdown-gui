@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,13 @@ IMAGE_TRANSCRIPTION_PROMPT = (
     "in a code fence — output only the transcribed content as Markdown."
 )
 
+# MarkItDown's PPTX converter writes each picture as ``![alt](<shape>.jpg)``,
+# a filename made up from the shape name (``Google Shape;64;p1`` ->
+# ``GoogleShape64p1.jpg``) that is never written anywhere — every such link
+# is broken. With ``keep_data_uris`` it inlines the real bytes instead; any
+# made-up reference left after image handling is removed.
+_PPTX_PLACEHOLDER_IMAGE_RE = re.compile(r"^!\[[^\]\n]*\]\(\w+\.jpg\)[ \t]*\n?", re.MULTILINE)
+
 
 @dataclass
 class ConversionItem:
@@ -47,6 +55,14 @@ class ConversionItem:
 
     def label(self) -> str:
         return self.drive.display() if self.drive else str(self.source)
+
+    def title(self) -> str:
+        """The document's name, for a heading: the Drive title, or the
+        local file name without its extension."""
+        if self.drive is None:
+            return self.source.stem
+        name = self.drive.name
+        return name if self.drive.is_google_native else Path(name).stem
 
 
 @dataclass
@@ -75,6 +91,7 @@ class ConversionWorker(QObject):
         extract_pdf_images: bool = False,
         strip_pdf_page_numbers: bool = False,
         strip_pdf_headers_footers: bool = False,
+        normalize_headings: bool = False,
         ocr: OcrConfig | None = None,
     ) -> None:
         super().__init__()
@@ -86,6 +103,7 @@ class ConversionWorker(QObject):
         self._extract_pdf_images = extract_pdf_images
         self._strip_pdf_page_numbers = strip_pdf_page_numbers
         self._strip_pdf_headers_footers = strip_pdf_headers_footers
+        self._normalize_headings = normalize_headings
         self._ocr = ocr or OcrConfig()
         self._cancelled = False
         self._drive_service = None
@@ -102,6 +120,14 @@ class ConversionWorker(QObject):
     def _build_text_markitdown(self) -> MarkItDown:
         """Build the standard MarkItDown used for non-scanned files."""
         md = MarkItDown()
+        # Keeps mixed bold/italic valid Markdown and, with heading
+        # normalisation on, maps Word's Title style to the H1 (see
+        # docx_converter).
+        from .docx_converter import CleanDocxConverter
+
+        md.register_converter(
+            CleanDocxConverter(map_title=self._normalize_headings), priority=-1.0
+        )
         if self._detect_pdf_tables:
             from .pdf_table_converter import PdfPlumberTableConverter
 
@@ -274,10 +300,14 @@ class ConversionWorker(QObject):
             item.is_scanned = is_scanned_pdf(str(item.source))
 
     def run(self) -> None:
+        # ``finished`` is emitted only after the staging folder is removed,
+        # so the thread has no work left once the GUI hears about it.
         with tempfile.TemporaryDirectory(prefix="markitdown-gdrive-") as staging:
-            self._run(Path(staging))
+            success, failure = self._run(Path(staging))
+        self.finished.emit(success, failure)
 
-    def _run(self, staging: Path) -> None:
+    def _run(self, staging: Path) -> tuple[int, int]:
+        """Convert every item; returns ``(success_count, failure_count)``."""
         try:
             self._prepare_drive(staging)
             text_md, ocr_md, image_md = self._build_converters()
@@ -286,8 +316,7 @@ class ConversionWorker(QObject):
             self.log.emit(f"! Failed to initialise converter: {exc}")
             self.log.emit("! No files were converted.")
             self.log.emit("=" * 60)
-            self.finished.emit(0, len(self._items))
-            return
+            return 0, len(self._items)
 
         # Pipe per-page OCR progress (emitted from inside the markitdown-ocr
         # plugin) into our log so the user sees what's happening during long
@@ -336,7 +365,14 @@ class ConversionWorker(QObject):
 
                 md, route = self._pick_converter(item, text_md, ocr_md, image_md)
                 self.log.emit(f"Converting [{route}]: {item.label()}")
-                result = md.convert(str(item.source))
+                convert_kwargs = {}
+                is_pptx = item.source.suffix.lower() == ".pptx"
+                if is_pptx and (self._embed_pdf_images or self._extract_pdf_images):
+                    # Real image bytes inline at each slide's position, so
+                    # embed/extract can place them instead of appending all
+                    # media at the end.
+                    convert_kwargs["keep_data_uris"] = True
+                result = md.convert(str(item.source), **convert_kwargs)
                 text_content = result.text_content
 
                 # Links between Google Docs point at docs.google.com; turn
@@ -456,6 +492,17 @@ class ConversionWorker(QObject):
                         text_content.rstrip() + "\n\n" + images_md + "\n"
                     )
 
+                if is_pptx:
+                    text_content, dropped = _PPTX_PLACEHOLDER_IMAGE_RE.subn(
+                        "", text_content
+                    )
+                    if dropped:
+                        self.log.emit(
+                            f"  -> removed {dropped} slide image link(s) to "
+                            "files MarkItDown never writes (enable an image "
+                            "option to keep the images)"
+                        )
+
                 # Strip empty / image-only headings that mammoth leaves
                 # behind in DOCX output — they lint as MD042 in any
                 # markdown linter and break tables of contents.
@@ -519,14 +566,29 @@ class ConversionWorker(QObject):
                 # Runs before the lint pass so MD012/MD022 tidy the gap it
                 # leaves, and before the index is built below so the same
                 # cleaned text feeds both the main file and its index.
+                # Only when the file is long enough to actually get an index —
+                # a short document keeps its contents list, since nothing
+                # replaces it.
+                toc_removed = False
                 if generate_index:
-                    text_content, removed_toc = strip_table_of_contents(
-                        text_content
-                    )
-                    if removed_toc:
+                    from .indexer import should_index
+
+                    stripped, removed_toc = strip_table_of_contents(text_content)
+                    if removed_toc and should_index(stripped):
+                        text_content = stripped
+                        toc_removed = True
                         self.log.emit(
                             f"  -> removed table of contents ({removed_toc} "
                             "line(s))"
+                        )
+                if not toc_removed:
+                    from .markdown_cleanup import tidy_table_of_contents
+
+                    text_content, tidied = tidy_table_of_contents(text_content)
+                    if tidied:
+                        self.log.emit(
+                            f"  -> table of contents: {tidied} entr(y/ies) "
+                            "as a link list"
                         )
 
                 # API reference tables (Field | Datatype | Size | Comment):
@@ -558,6 +620,20 @@ class ConversionWorker(QObject):
                         f"{rule}:{n}" for rule, n in sorted(lint_fixes.items())
                     )
                     self.log.emit(f"  -> markdownlint auto-fixed {summary}")
+
+                # After the lint pass, which can itself promote numbered
+                # section titles to headings, so its levels are covered too.
+                if self._normalize_headings:
+                    from .markdown_cleanup import normalize_heading_structure
+
+                    text_content, heading_fixes = normalize_heading_structure(
+                        text_content, item.title()
+                    )
+                    if heading_fixes:
+                        self.log.emit(
+                            f"  -> normalised heading structure "
+                            f"({heading_fixes} heading(s) changed)"
+                        )
 
                 item.destination.parent.mkdir(parents=True, exist_ok=True)
                 item.destination.write_text(text_content, encoding="utf-8")
@@ -602,16 +678,75 @@ class ConversionWorker(QObject):
                 pass
 
         self.progress.emit(total, total, "")
-        self.finished.emit(success, failure)
+        return success, failure
+
+
+# Every started thread and its worker, kept referenced until the thread has
+# actually stopped. ``worker.finished`` reaches the GUI while the thread is
+# still winding down; if the GUI's reference were the only one, dropping it
+# then would let Python destroy a running QThread, which aborts the process
+# ("QThread: Destroyed while thread is still running").
+_running: dict[QThread, ConversionWorker] = {}
+
+
+class _Reaper(QObject):
+    """Releases finished threads on the GUI thread.
+
+    ``QThread.finished`` is emitted from the worker thread just *before* it
+    stops, so releasing there (or in a plain lambda, which runs on that same
+    thread) is still too early. A slot on this main-thread object is queued
+    instead; by the time it runs, ``wait()`` returns at once and the thread
+    can be dropped safely.
+    """
+
+    def release(self) -> None:
+        for thread in [t for t in _running if t.isFinished()]:
+            thread.wait()
+            _running.pop(thread, None)
+
+
+_reaper: _Reaper | None = None
 
 
 def run_in_thread(worker: ConversionWorker) -> QThread:
-    """Move a worker onto a fresh QThread and start it. Returns the thread."""
+    """Move a worker onto a fresh QThread and start it. Returns the thread.
+
+    Must be called from the GUI thread. The thread and worker are owned by
+    Python and freed by :class:`_Reaper` once the thread has stopped — no
+    ``deleteLater``, which could race the release.
+    """
+    global _reaper
+    if _reaper is None:
+        _reaper = _Reaper()
     thread = QThread()
+    _running[thread] = worker
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
-    worker.finished.connect(worker.deleteLater)
-    thread.finished.connect(thread.deleteLater)
+    thread.finished.connect(_reaper.release)
     thread.start()
     return thread
+
+
+def running_thread_count() -> int:
+    """How many worker threads are still tracked. For tests."""
+    return len(_running)
+
+
+def stop_threads(timeout_ms: int = 5000) -> bool:
+    """Cancel every running worker and wait for its thread to stop.
+
+    Called on window close: quitting while a thread runs aborts the process
+    the same way. Workers check their cancel flag between files, so a file
+    mid-conversion (a long OCR run) may outlast the timeout. Returns True
+    if every thread stopped in time.
+    """
+    all_stopped = True
+    for thread, worker in list(_running.items()):
+        if not thread.isRunning():
+            continue
+        worker.cancel()
+        thread.quit()
+        if not thread.wait(timeout_ms):
+            all_stopped = False
+    return all_stopped

@@ -200,6 +200,14 @@ _TOC_DOTLEADER_RE = re.compile(r"^\s*\S.*?(?:\.\s*){3,}\d{1,6}\s*$")
 # e.g. ``- [Introduction](#introduction)`` (Word-TOC / md-export shape).
 _TOC_LINK_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[[^\]]+\]\([^)]*\)\s*$")
 
+# A Word / Google Docs TOC paragraph converted from DOCX: one link to an
+# in-document bookmark, optionally followed by its page number, e.g.
+# ``[Visa budget](#_4d34og8) 14`` or ``[**Budget**](#_30j0zll) **4**``. The
+# bookmarks don't survive conversion, so these links lead nowhere.
+_TOC_ANCHOR_PARA_RE = re.compile(
+    r"^\s*\[(?:[^\]\n]|\][^(])+\]\(#[^)\s]+\)(?:\s*\**\s*\d{1,4}\s*\**)?\s*$"
+)
+
 # Heading text (case-folded, surrounding punctuation stripped) that names a
 # contents page, across the languages these documents appear in. Matched by
 # exact membership *or* ``startswith`` so "Table of Content" (no plural) and
@@ -225,9 +233,97 @@ _TOC_HEADING_TITLES: frozenset[str] = frozenset(
 # not a TOC, three in a row is.
 _MIN_TOC_ENTRIES = 3
 
+# One "title  page" pair of a contents page whose leaders were lost in PDF
+# extraction: "Autogiro 8", "Ärenden (Tasks) 5". Several can share a line
+# when the extractor flowed a contents column into one paragraph.
+_TOC_PAIR_RE = re.compile(r"(?P<title>\S.*?)\s+(?P<page>\d{1,3})(?=\s|$)")
+_XREF_STRIP_RE = re.compile(r"^[#\s*●•\-]+|[\s*]+$")
+
+
+def _xref_key(text: str) -> str:
+    return _XREF_STRIP_RE.sub("", text).casefold()
+
+
+def _xref_toc_entries(
+    line: str, last_at: dict[str, int], after: int, lenient: bool = False
+) -> int:
+    """Number of "title page" pairs on ``line`` whose title reappears later
+    in the document as a line of its own, or 0 if ``line`` is not made of
+    such pairs.
+
+    This catches a contents page whose dotted leaders didn't survive
+    extraction — each entry is then just "title page", on its own line or
+    run together in one paragraph. What gives it away is that the titles
+    are the document's own section titles: at least half of them must
+    appear later as standalone lines (headings, or the body's section
+    labels) — or, with ``lenient`` (a line continuing an established
+    block), at least one. Up to 120 characters of a title wrapped onto the
+    next line may trail the last pair.
+    """
+    body = _XREF_STRIP_RE.sub("", line)
+    if not body:
+        return 0
+    pairs = list(_TOC_PAIR_RE.finditer(body))
+    if not pairs or pairs[0].start() != 0:
+        return 0
+    if any(body[a.end():b.start()].strip() for a, b in zip(pairs, pairs[1:])):
+        return 0
+    if len(body) - pairs[-1].end() > 120:
+        return 0
+    # Page order isn't checked: a title containing a number ("… till 64
+    # tecken 10") splits into extra pairs with out-of-order "pages", and
+    # the title cross-check below is the stronger signal anyway.
+    titles = [_xref_key(p.group("title")) for p in pairs]
+    found = sum(1 for t in titles if last_at.get(t, -1) > after)
+    needed = 1 if lenient else (len(pairs) + 1) // 2
+    return len(pairs) if found >= needed else 0
+
+
+def _strip_xref_toc(lines: list[str], skip: set[int], remove: list[bool]) -> None:
+    """Mark a leader-less contents block (see :func:`_xref_toc_entries`)."""
+    n = len(lines)
+    # For each standalone line text, the last index it occurs at.
+    last_at: dict[str, int] = {}
+    for k, ln in enumerate(lines):
+        key = _xref_key(ln)
+        if key and k not in skip:
+            last_at[key] = k
+    i = 0
+    while i < n:
+        if i in skip or remove[i] or _is_blank(lines[i]):
+            i += 1
+            continue
+        entries = _xref_toc_entries(lines[i], last_at, i)
+        if not entries:
+            i += 1
+            continue
+        j, last, total = i, i - 1, 0
+        while j < n and j not in skip:
+            if _is_blank(lines[j]):
+                j += 1
+                continue
+            # Once a block is established, one recognised title per line
+            # is enough: titles split by embedded numbers rarely all match.
+            got = _xref_toc_entries(lines[j], last_at, i, lenient=j > i)
+            if not got:
+                break
+            total += got
+            last = j
+            j += 1
+        if total >= _MIN_TOC_ENTRIES and last > i:
+            for k in range(i, last + 1):
+                remove[k] = True
+            i = last + 1
+        else:
+            i += 1
+
 
 def _is_toc_entry(line: str) -> bool:
-    return bool(_TOC_DOTLEADER_RE.match(line) or _TOC_LINK_ITEM_RE.match(line))
+    return bool(
+        _TOC_DOTLEADER_RE.match(line)
+        or _TOC_LINK_ITEM_RE.match(line)
+        or _TOC_ANCHOR_PARA_RE.match(line)
+    )
 
 
 def _toc_heading_title(line: str) -> str | None:
@@ -257,7 +353,14 @@ def strip_table_of_contents(markdown: str) -> tuple[str, int]:
     * a **TOC heading** ("Table of Contents", "Innehåll", ...) plus the block
       of dotted-leader / anchor-link entries that follows it, and
     * a **heading-less dotted-leader run** of at least ``_MIN_TOC_ENTRIES``
-      entries, which a contents page often becomes when its heading is lost.
+      entries, which a contents page often becomes when its heading is lost,
+      and
+    * a **heading-less run of bookmark links** (``[Title](#_bookmark) 4``) of
+      at least ``_MIN_TOC_ENTRIES`` entries — the shape a Word or Google Docs
+      contents field takes after DOCX conversion, and
+    * a **leader-less contents block** — lines of "title page" pairs whose
+      titles reappear later as the document's own section lines (a PDF
+      contents page that lost its dotted leaders).
 
     While inside a block, blank lines and the contents pages' own footer page
     numbers are absorbed; the block ends at the first line of real content
@@ -310,7 +413,7 @@ def strip_table_of_contents(markdown: str) -> tuple[str, int]:
                 continue
             i += 1
             continue
-        if _TOC_DOTLEADER_RE.match(lines[i]):
+        if _TOC_DOTLEADER_RE.match(lines[i]) or _TOC_ANCHOR_PARA_RE.match(lines[i]):
             last, entries = _consume(i)
             if entries >= _MIN_TOC_ENTRIES:
                 for k in range(i, last + 1):
@@ -321,6 +424,8 @@ def strip_table_of_contents(markdown: str) -> tuple[str, int]:
             continue
         i += 1
 
+    _strip_xref_toc(lines, skip, remove)
+
     removed = sum(remove)
     if not removed:
         return markdown, 0
@@ -329,6 +434,142 @@ def strip_table_of_contents(markdown: str) -> tuple[str, int]:
     if markdown.endswith("\n") and not new_md.endswith("\n"):
         new_md += "\n"
     return new_md, removed
+
+
+_TOC_ENTRY_PARTS_RE = re.compile(
+    r"^\s*\[(?P<text>(?:[^\]\n]|\][^(])+)\]\((?P<target>#[^)\s]+)\)(?P<tail>.*)$"
+)
+# A page number at the end of the link text, before any closing emphasis:
+# "Förutsättningar 3" / "**Ärenden 4**".
+_TRAILING_PAGE_RE = re.compile(r"\s+\d{1,4}(?P<close>[*_]*)$")
+
+
+def _toc_list_item(line: str) -> str | None:
+    """``[Budget](#budget) 4`` -> ``- [Budget](#budget)``.
+
+    The page number is dropped from after the link when it is there, and
+    only otherwise from the end of the link text — so a title that itself
+    ends in a number ("Section 3") keeps it.
+    """
+    m = _TOC_ENTRY_PARTS_RE.match(line)
+    if not m:
+        return None
+    text = m.group("text").strip()
+    if not m.group("tail").strip():
+        text = _TRAILING_PAGE_RE.sub(lambda p: p.group("close"), text)
+    return f"- [{text}]({m.group('target')})"
+
+
+def tidy_table_of_contents(markdown: str) -> tuple[str, int]:
+    """Turn a kept Word / Google Docs contents block into a plain link list.
+
+    For a document that keeps its contents (no sidecar index replaces it),
+    each entry ``[Budget](#budget) 4`` becomes ``- [Budget](#budget)``: the
+    page number means nothing in Markdown, and a list is what the block is.
+    Applies to runs of at least ``_MIN_TOC_ENTRIES`` bookmark-link
+    paragraphs, the blank lines between them dropped. Returns
+    ``(new_markdown, entries_rewritten)``.
+    """
+    lines = markdown.split("\n")
+    skip = _compute_skip_lines(lines)
+    out: list[str] = []
+    i, n, count = 0, len(lines), 0
+    while i < n:
+        if i in skip or not _TOC_ANCHOR_PARA_RE.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        block: list[int] = []
+        j = i
+        while j < n and j not in skip:
+            if _is_blank(lines[j]):
+                j += 1
+                continue
+            if not _TOC_ANCHOR_PARA_RE.match(lines[j]):
+                break
+            block.append(j)
+            j += 1
+        if len(block) < _MIN_TOC_ENTRIES:
+            out.append(lines[i])
+            i += 1
+            continue
+        for k in block:
+            item = _toc_list_item(lines[k])
+            out.append(item if item is not None else lines[k])
+            count += item is not None
+        i = block[-1] + 1
+    return "\n".join(out), count
+
+
+# ---------------------------------------------------------------------------
+# Heading structure
+# ---------------------------------------------------------------------------
+
+_ATX_HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})(?P<rest>[ \t].*|)$")
+
+
+def normalize_heading_structure(markdown: str, title: str = "") -> tuple[str, int]:
+    """Give the document one H1 and no skipped heading levels.
+
+    Source documents often go straight from Heading 1 to Heading 3, and
+    many use Heading 1 for every chapter. Both carry over faithfully into
+    Markdown, where they fail markdownlint's MD001 (heading levels increase
+    by one) and MD025 (one top-level heading), and give the sidecar index
+    a lopsided outline. Two passes:
+
+    1. **One H1.** If more than one ``#`` heading exists, every heading is
+       demoted one level (capped at H6) and ``# <title>`` — the document's
+       name — is inserted at the top, so the chapters become its H2s.
+    2. **No skipped levels.** Each heading is renumbered to one level below
+       the nearest preceding heading of a *higher* source level; a heading
+       with none keeps its level. Relative structure survives: headings
+       that were siblings stay siblings, children stay children —
+       ``H1, H3, H4, H3, H2`` becomes ``H1, H2, H3, H2, H2``.
+
+    Only ATX headings outside fenced code / front matter are touched.
+    Returns ``(new_markdown, headings_changed)``, counting an inserted title.
+    """
+    lines = markdown.split("\n")
+    skip = _compute_skip_lines(lines)
+    heads: list[tuple[int, int]] = []  # (line index, level)
+    for i, line in enumerate(lines):
+        if i in skip:
+            continue
+        m = _ATX_HEADING_RE.match(line)
+        if m:
+            heads.append((i, len(m.group("hashes"))))
+    if not heads:
+        return markdown, 0
+
+    changed = 0
+    levels = [lvl for _, lvl in heads]
+    insert_title = levels.count(1) > 1 and bool(title.strip())
+    if insert_title:
+        levels = [min(lvl + 1, 6) for lvl in levels]
+
+    # Pass 2: stack of (source level, output level) for the open sections.
+    stack: list[tuple[int, int]] = []
+    out_levels: list[int] = []
+    for lvl in levels:
+        while stack and stack[-1][0] >= lvl:
+            stack.pop()
+        out = min(stack[-1][1] + 1 if stack else lvl, 6)
+        stack.append((lvl, out))
+        out_levels.append(out)
+
+    for (i, original), new in zip(heads, out_levels):
+        if new != original:
+            m = _ATX_HEADING_RE.match(lines[i])
+            lines[i] = "#" * new + m.group("rest")
+            changed += 1
+
+    if insert_title:
+        at = _compute_frontmatter_end(lines)
+        lines[at:at] = [f"# {title.strip()}", ""]
+        changed += 1
+
+    new_md = "\n".join(lines)
+    return new_md, changed
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +730,14 @@ def fix_numbered_section_headings(text: str) -> tuple[str, int]:
         if len(title) > 50 or len(title.split()) > 7 or title[-1] in ".:,;!":
             continue
         num = m.group("num")
+        # A section number has small parts and is followed by words. A date
+        # ("2025.12.01 8" — a contents-page line, the trailing 8 its page)
+        # or version string is neither: no part over 99, and a title with
+        # at least two letters.
+        if any(len(part) > 2 for part in num.rstrip(".").split(".")):
+            continue
+        if sum(1 for c in title if c.isalpha()) < 2:
+            continue
         depth = num.rstrip(".").count(".") + 1  # "1." -> 1, "3.6" -> 2
         if depth == 1 and _adjacent_numbered_item(lines, i):
             continue

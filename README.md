@@ -2,9 +2,10 @@
 
 ![Application screenshot](screenshot.png)
 
-A Windows desktop GUI for batch-converting PDFs, Office documents, images,
-audio, HTML, EPUB and more into clean Markdown. Built on top of Microsoft's
-[MarkItDown](https://github.com/microsoft/markitdown) library with five
+A desktop GUI — **Windows and Linux** — for batch-converting PDFs, Office
+documents, Google Docs, images, audio, HTML, EPUB and more into clean
+Markdown. Built on top of Microsoft's
+[MarkItDown](https://github.com/microsoft/markitdown) library with these
 extras layered on top:
 
 1. **Table-aware PDF conversion** — proper `| col | col |` Markdown tables
@@ -23,6 +24,15 @@ extras layered on top:
    OpenAI, Azure, Google Gemini, Groq, OpenRouter, Mistral, LM Studio, and
    Ollama; a Detect button probes localhost for running servers and lists
    their vision-capable models.
+6. **Google Drive as a source** — convert a whole Drive folder tree (Docs,
+   Sheets, Slides and uploaded files) into a matching local folder tree of
+   `.md` files, with links between Docs rewritten to links between the
+   `.md` files. The reverse of
+   [Confluence L33ch](https://github.com/ms4ndst/confluence-l33ch)'s
+   *Upload to Google Docs*.
+7. **Markdownlint-clean output** — every file goes through a cleanup pass
+   (empty headings, broken tables, list/heading spacing, bare URLs, …) so it
+   passes a Markdown linter without manual fixing.
 
 The UI is themed with [Catppuccin](https://github.com/catppuccin/catppuccin),
 defaulting to **Mocha** with a **Mauve** accent. All four flavors
@@ -34,7 +44,7 @@ runtime from the status-bar dropdowns; the choice persists to `config.json`.
 ## Features
 
 ### Batch conversion
-- Pick individual files or recurse into a folder
+- Pick individual files, recurse into a folder, or add a Google Drive folder
 - Input / output directory pickers with auto-suggested output path
 - Mirror folder structure (preserve subdirectories) or flatten
 - Overwrite protection — opt in to replace existing `.md` files
@@ -54,7 +64,10 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
   - Collapses mutually exclusive adjacent column pairs (caused by header
     indentation)
   - Rejects 1-column boxes and prose-heavy "tables"
-- Promotes large-font lines to `# / ## / ### headings`
+- Promotes large-font lines to `# / ## / ### headings` — but never a bullet
+  (`● …`) or its wrapped second line, and never a block that adds up to
+  more than 120 characters or several sentences (slides often set body
+  text in a large font)
 
 ### Generate index.md for large files *(on by default)*
 - Triggers only when the output is over ~500 lines
@@ -67,6 +80,18 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
   - HTTP-style endpoints (`GET /api/...`, `Get method : /api/...`)
 - Filters out repeated page headers/footers and code-like lines
 - Groups endpoints by their first path segment
+- Removes the document's **own table of contents** from the main file —
+  the sidecar index replaces it. Recognised shapes:
+  - a "Table of Contents" / "Innehåll" heading with its entries
+  - a run of dotted-leader lines (`Inledning ....... 3`, PDF)
+  - a run of bookmark links, `[Budget](#budget) 4` (a Word / Google Docs
+    contents field after DOCX conversion)
+  - a PDF contents page whose leaders were lost — lines of "title page"
+    pairs, possibly run together (`Control Edge 4 Autogiro 8 …`), whose
+    titles reappear later in the document as its own section lines
+- Only for files long enough to get an index. Shorter files keep their
+  contents, tidied into a link list without page numbers
+  (`- [Budget](#budget)`)
 - **Per folder:** when the queued files span subfolders, **Folders…** next
   to the checkbox opens the output folder tree. Each folder's tick covers
   the files directly inside it; changing a folder changes every folder
@@ -96,9 +121,81 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
   offline. Links to Docs outside the queue are left pointing at Google
 - Names are sanitised for Windows and made unique per folder (two Docs
   called *Notes* become `Notes.md` and `Notes (2).md`)
+- Output names follow the Drive titles. Files Confluence L33ch exported
+  with a `_<page id>` suffix were uploaded under the bare page title, so
+  they come back without the suffix
 - Files are downloaded into a temporary folder just before each is
-  converted and deleted when the run ends. Drive PDFs are probed for
-  scanned pages after download, so OCR routing still works
+  converted and deleted when the run ends — nothing is kept locally except
+  the `.md` output (and `images/`, if extracting images). Drive PDFs show no
+  SCAN badge in the queue, since they aren't downloaded yet; they are
+  probed after download, so OCR routing still works
+- **Read-only:** the app requests the `drive.readonly` scope and never
+  changes anything in Drive
+- Limitations:
+  - No incremental sync — each run converts every queued file again; tick
+    *Overwrite existing .md files* to re-run into the same output folder
+  - Comments and suggestions in Docs are not carried over
+  - Empty Drive folders (or folders with only skipped files) produce no
+    output folder
+  - With *Mirror input folder structure* off, every file lands in the
+    output root and same-named files from different folders overwrite or
+    collide — keep mirroring on for Drive
+
+### Normalise heading structure *(on by default)*
+Source documents often skip heading levels (Heading 1 straight to Heading 3)
+or use Heading 1 for every chapter. Converted faithfully, that fails
+markdownlint's MD001 / MD025 and gives the sidecar index a lopsided
+outline. With this option on:
+- A Word / Google Docs **Title** paragraph becomes the `#` heading and
+  Heading 1–5 move down to `##`–`######` (mammoth otherwise renders the
+  title as a plain paragraph)
+- A file that still has several `#` headings gets **its name** (the Drive
+  title, or the file name) as the `#` heading, and every heading moves
+  down one level
+- **Skipped levels are closed up**: each heading becomes one level below
+  the nearest preceding heading of a higher source level, so siblings stay
+  siblings and children stay children — `H1, H3, H4, H3, H2` becomes
+  `H1, H2, H3, H2, H2`
+- Runs after every other cleanup step (including the numbered-section pass
+  below), so the written file and its index share the final structure.
+  Untick to keep the source's heading levels exactly
+
+### Markdown cleanup *(always on)*
+Runs on every converted file, after image handling and before writing:
+- **Bookmark links (DOCX)** — contents entries and cross-references link to
+  Word bookmarks (`#_30j0zll`, `#_Toc123`), which the conversion drops.
+  A link to a bookmark inside a heading is pointed at that heading's
+  anchor (`#budget`, the slug GitHub, VS Code and most renderers generate;
+  duplicates get `-1`, `-2`); a link to any other bookmark becomes plain
+  text, so no in-document link leads nowhere
+- **Mixed bold / italic (DOCX)** — Word stores formatting per run, so a
+  sentence in italics with one bold-italic word would otherwise become
+  `***Anm****: …*`, and emphasis on punctuation (an italic period, a bold
+  run starting with a comma) becomes `attesterad*.*`. Both show literal
+  asterisks when rendered. Sibling runs are merged and punctuation moved
+  outside the emphasis before conversion, giving `***Anm**: …*`
+- **Empty headings** — bare `#` lines and image-only headings left by DOCX
+  conversion are removed or demoted (see
+  [Empty-heading cleanup](#empty-heading-cleanup-always-on))
+- **Reference tables** — API field tables (`Field | Datatype | Size |
+  Comment`) get blank headers named and datatype casing normalised
+  (`string` → `String`). Unknown datatypes — usually typos in the source —
+  are listed as `!` warnings in the log
+- **Markdownlint auto-fixes** for rules that are safe to fix mechanically:
+  MD009 trailing spaces, MD010 hard tabs, MD012 multiple blank lines, MD018
+  missing space after `#`, MD022/MD031/MD032 blank lines around headings,
+  code fences and lists, MD025 first body H1 demoted when front matter has a `title:`,
+  MD026 trailing punctuation in headings, MD029 ordered-list numbering,
+  MD034 bare URLs, MD047 final newline. It also converts form feeds and
+  `•` bullets, rejoins list items split across lines, promotes numbered
+  section titles (`3.6 Sekretess`) to headings — dates and versions such
+  as `2025.12.01 8` excluded — and rebuilds malformed PDF tables into valid
+  GFM tables (deeply nested pipe runs otherwise hit parser nesting limits)
+- MD001 / MD025 are handled by
+  [Normalise heading structure](#normalise-heading-structure-on-by-default).
+  Rules that need human judgment (e.g. MD041 first-line heading, MD045 alt
+  text) are left for your linter. The log shows what was fixed, e.g.
+  `-> markdownlint auto-fixed MD012:4, MD022:9`
 
 ### Embed document images as base64 *(off by default)*
 - Works on **PDF, DOCX, PPTX, XLSX, EPUB** — not just PDFs
@@ -113,7 +210,9 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
   `![](data:image/png;base64...)` placeholders with no real bytes — the
   rewriter substitutes the real base64 pulled from `word/media/` in document
   order so the resulting `data:` URIs actually display at the right place
-- For PPTX / XLSX / EPUB (where MarkItDown drops images entirely), the
+- For PPTX, slides are converted with their real image bytes, so each
+  image is embedded **on its own slide**
+- For XLSX / EPUB (where MarkItDown drops images entirely), the
   rewriter pulls them straight from the source ZIP and appends an
   **Embedded images** section (no on-page coordinates available for these)
 - Runs as a post-processing step, so it composes with table detection and OCR
@@ -130,6 +229,9 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
 - For DOCX, every truncated `![](data:image/png;base64...)` placeholder
   MarkItDown emits is rewritten **in place** to point at the on-disk file —
   no broken `base64...` URIs are left in the output
+- For PPTX, each slide image is written to `images/` and linked **on its
+  own slide**. Without an image option, MarkItDown's links to made-up
+  `<shape name>.jpg` files (which would all be broken) are removed
 - Identical images are deduped — by **PDF xref** (one PNG per unique image,
   shared across every page reference) for PDFs, by **SHA-256 of the bytes**
   for OOXML / EPUB (a logo referenced 50× becomes one file)
@@ -141,8 +243,8 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
 ### Scanned-PDF detection *(automatic)*
 - Every queued PDF is probed asynchronously after being added
 - Pages with images but no extractable text are counted as scanned
-- A file is tagged with a **SCAN** badge (Amplify-orange pill) if ≥ 80% of
-  pages are scanned
+- A file is tagged with a **SCAN** badge (Catppuccin Peach pill) if ≥ 80%
+  of pages are scanned
 - The badge tells the converter to route the file through OCR; non-scanned
   files skip OCR entirely (no wasted LLM calls)
 
@@ -170,7 +272,9 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
 
 ## Install
 
-Requires **Python 3.10+** (tested on 3.14, Windows 11).
+Requires **Python 3.10+** (tested on 3.14, Windows 11). Runs on Windows and Linux.
+
+**Windows:**
 
 ```powershell
 git clone <this-repo>
@@ -179,6 +283,20 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install .
 ```
+
+**Linux** (or use the [Linux installer](#linux-installer) below):
+
+```bash
+git clone <this-repo>
+cd markitdown_gui
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
+```
+
+On Debian/Ubuntu, PySide6's Qt platform plugin needs a few system
+libraries pip doesn't install — if the app fails to start with an `xcb`
+error, run `sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libgl1`.
 
 This installs a `markitdown-gui` command on your PATH (a `pythonw.exe`-based
 launcher on Windows, so no console window appears behind the Qt UI).
@@ -193,15 +311,17 @@ pip install -e .
 The dependency list (declared in [`pyproject.toml`](pyproject.toml)) pulls
 `PySide6`, a curated set of MarkItDown extras
 (`markitdown[pdf,docx,xlsx,xls,pptx,outlook,audio-transcription]`),
-`markitdown-ocr`, and `openai`. `markitdown[all]` is **deliberately
+`markitdown-ocr`, `openai`, and the Google client libraries
+(`google-api-python-client`, `google-auth-oauthlib`). `markitdown[all]` is **deliberately
 avoided** — it pins `youtube-transcript-api~=1.0.0`, every 1.0.x release
 of which declares `Requires-Python <3.14`, so `[all]` cannot resolve on
 Python 3.14. The curated set covers every format the GUI actually
 surfaces (PDF, DOCX, XLSX/XLS, PPTX, .msg, audio); EPUB / HTML / CSV
 need no extra. `markitdown-ocr` and `openai` are only used by the OCR
-feature; the rest of the app runs fine without them — use
-`pip install --no-deps .` and curate manually if you want a leaner
-footprint.
+feature, and the Google libraries only by the Google Drive source; the rest
+of the app runs fine without them (the Drive buttons then report the
+missing package) — use `pip install --no-deps .` and curate manually if
+you want a leaner footprint.
 
 ### Linux installer
 
@@ -254,23 +374,59 @@ upstream is unchanged.
 ### 1. Pick input + output
 Pick an **input directory** — the output dir auto-fills to
 `<input>/markdown_output` (editable). Pick an **output directory** if you
-want it elsewhere.
+want it elsewhere. The input directory is the root that *Mirror input folder
+structure* mirrors from; it isn't needed when converting only from Google
+Drive (the Drive folder is the root then).
 
 ### 2. Queue files
 **Add files…** or **Add folder…** to populate the queue. "Add folder" pulls
 every supported file recursively. As PDFs are added they're probed for
 scan-vs-text status in the background; scanned ones get a **SCAN** badge.
 
-**Google Drive (optional):** in **Google Drive source**, choose the OAuth
-client file (a *Desktop app* OAuth client from a Google Cloud project with
-the **Google Drive API** enabled), click **Sign in…** and approve read-only
-access in the browser. Then paste the Drive folder URL and click
-**Add from Drive**. Keep *Mirror input folder structure* ticked to recreate
-the Drive folder tree in the output.
+**From Google Drive:** after the [one-time setup](#google-drive-setup-one-time),
+paste the folder's URL into **Google Drive source** — the address from the
+browser, e.g. `https://drive.google.com/drive/folders/1AbC…` (`/u/1/`
+variants, `?usp=sharing` links, `open?id=` links and a bare folder ID all
+work) — and click **Add from Drive**. The listing runs in the background;
+when it finishes, every convertible file appears in the queue as
+`Google Drive › Folder/Sub/Name  (Google Doc)`, and skipped items are
+named in the log. You can mix Drive and local files in one queue, and
+click **Add from Drive** again to pick up new files (already-queued ones
+aren't added twice).
+
+### Google Drive setup (one-time)
+
+Google sign-in needs an **OAuth client** belonging to a Google Cloud
+project. In a company Google Workspace, ask IT for one; otherwise create it
+yourself:
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create
+   or pick a project.
+2. **APIs & Services → Library** → enable the **Google Drive API**.
+3. **APIs & Services → OAuth consent screen** → configure it (type
+   *Internal* for a Workspace organisation, *External* otherwise) and add
+   the scope `https://www.googleapis.com/auth/drive.readonly`. While an
+   *External* app is in *Testing*, add your account under **Test users**.
+4. **APIs & Services → Credentials → Create credentials → OAuth client ID**
+   → application type **Desktop app** → download the JSON
+   (`client_secret_….json`).
+
+Then, in the app:
+
+1. **OAuth client** → **Browse…** → select the downloaded JSON file.
+2. Click **Sign in…**. A browser tab opens; choose the account and approve
+   read-only Drive access (you have 5 minutes). The label under the field
+   then shows *Signed in to Google as you@example.com*.
+
+The sign-in is remembered (see [Configuration](#configuration)); the button
+turns into **Sign out**, which forgets it. The OAuth client from
+Confluence L33ch works too if it allows the `drive.readonly` scope — the
+two apps keep separate sign-ins.
 
 ### 3. Toggle options
 - *Overwrite existing .md files* — needed if you re-run a conversion.
-- *Mirror input folder structure in output* — preserves subdirectories.
+- *Mirror input folder structure in output* — preserves subdirectories
+  (of the input directory, or of the Drive folder).
 - *Detect tables in PDFs* — uses the table-aware converter. Auto-ticked
   whenever an image mode is enabled, since inline image placement is
   driven by the same converter.
@@ -288,6 +444,9 @@ the Drive folder tree in the output.
   subfolders.
 - *Strip page numbers in PDFs* — removes isolated page-number lines
   (`5`, `- 5 -`, `Page 5 of 20`) left as their own paragraphs. PDF-only.
+- *Normalise heading structure* — one `#` heading per file and no skipped
+  levels (see [the feature](#normalise-heading-structure-on-by-default)).
+  On by default; untick to keep the source's heading levels.
 - *Strip headers/footers in PDFs/DOCX* — removes lines that repeat 3+ times
   across the document (a running banner or title bar). Works for PDF page
   furniture and for DOCX files that carry the same banner typed into the
@@ -326,11 +485,32 @@ Two buttons:
   - ❌ Error with diagnostic hint (connection refused, 401, 404, OOM, timeout)
 
 ### 5. Convert
-Hit **Convert to Markdown** (purple CTA, bottom right). For each input you
-get:
+Hit **Convert to Markdown** (accent-coloured button, bottom right). For
+each input you get:
 
 - `<name>.md` — main Markdown output
-- `<name>.index.md` — sidecar navigation index (when enabled + file > 500 lines)
+- `<name>.index.md` — sidecar navigation index (when enabled for that file's
+  folder + file > 500 lines)
+- `images/<name>_…` — extracted images, when *Extract document images to
+  files* is on
+
+With mirroring on, the output folder tree matches the input directory or
+Drive folder. A file whose `.md` already exists is reported as failed
+(`already exists (overwrite disabled)`) unless *Overwrite existing .md
+files* is ticked. **Cancel** stops after the current file.
+
+For a Google Drive folder that came from Confluence L33ch, the result looks
+like:
+
+```
+Google Drive folder            Output directory
+├── README         (Doc)       ├── README.md
+├── Guide/                     ├── Guide/
+│   ├── Guide      (Doc)       │   ├── Guide.md
+│   ├── Install    (Doc)       │   ├── Install.md
+│   └── Budget     (Sheet)     │   └── Budget.md
+└── Notes          (Doc)       └── Notes.md
+```
 
 ---
 
@@ -363,7 +543,10 @@ smallest reliable vision model.
 All UI state auto-saves to a JSON config file the moment you change it
 (debounced to 500 ms). Loaded on startup.
 
-**Path:** `%LOCALAPPDATA%\MarkItDown\MarkItDown\config.json` *(Windows)*
+**Path:**
+
+- Windows: `%LOCALAPPDATA%\MarkItDown\MarkItDown\config.json`
+- Linux: `~/.config/MarkItDown/MarkItDown/config.json`
 
 On first launch after the Catppuccin rebrand, an existing config at the
 legacy `%LOCALAPPDATA%\Visma\MarkItDown\config.json` location is migrated
@@ -383,6 +566,7 @@ automatically — your API keys and preferences survive the change.
   "index_excluded_folders": ["Archive", "Archive/2023"],
   "input_dir": "C:\\Users\\you\\Downloads",
   "mirror": true,
+  "normalize_headings": true,
   "ocr": {
     "api_key": "your-api-key-here",
     "enabled": true,
@@ -392,6 +576,8 @@ automatically — your API keys and preferences survive the change.
   },
   "output_dir": "C:\\Users\\you\\Downloads\\markdown_output",
   "overwrite": false,
+  "strip_headers_footers": false,
+  "strip_pagenumbers": false,
   "theme": {
     "flavor": "mocha",
     "accent": "mauve"
@@ -409,9 +595,16 @@ automatically — your API keys and preferences survive the change.
 
 The file is human-editable. Delete it any time to start clean.
 
-The Google sign-in is stored next to it as `google-token.json` (owner-only
-permissions; it holds a refresh token for **read-only** Drive access).
-**Sign out** deletes it.
+`index_excluded_folders` lists the output folders (relative paths, `""`
+for the top level) set to *no index* in the **Folders…** dialog. It is
+kept across queues, so unticking `Archive` once applies to every later
+conversion that writes into an `Archive` folder.
+
+The Google sign-in is stored next to the config as `google-token.json`.
+It holds a refresh token for **read-only** Drive access and is created
+with owner-only permissions on Linux. **Sign out** deletes it; deleting
+it by hand does the same. The OAuth client file itself is only referenced
+by path, never copied.
 
 ---
 
@@ -421,11 +614,15 @@ permissions; it holds a refresh token for **read-only** Drive access).
 app/
   main.py                 # QApplication entry point (`markitdown-gui` / `python -m app.main`)
   main_window.py          # MainWindow + FileListDelegate (SCAN badge)
-  worker.py               # ConversionWorker (QThread), OcrConfig, per-file routing
+  main_window.py          # (also) IndexFoldersDialog — per-folder index picker
+  worker.py               # ConversionWorker (QThread), OcrConfig, per-file routing, Drive fetch
   gdrive.py               # Google Drive source — sign-in, folder listing, export, link rewriting
   pdf_table_converter.py  # PdfPlumberTableConverter — tables + font-size headings
   pdf_image_extractor.py  # Image extraction + inline-URI rewriting for PDF/OOXML/EPUB
-  markdown_cleanup.py     # strip_empty_headings() — kills MD042 violations
+  image_transcription_converter.py  # Clean image → Markdown transcription via a vision LLM
+  docx_converter.py       # CleanDocxConverter — Title → H1, bookmark links, mixed bold/italic
+  markdown_cleanup.py     # Empty headings, TOC removal, page numbers, headers/footers,
+                          #   reference tables, markdownlint auto-fixes
   indexer.py              # build_index() — sidecar <name>.index.md generator
   scan_detector.py        # Async pdfplumber-based scanned-PDF detection
   llm_discovery.py        # Provider presets + local LLM probing
@@ -437,6 +634,9 @@ markitdown/               # Vendored upstream MarkItDown source (see Credits)
     markitdown-ocr/       # LLM-vision OCR plugin (with local patches)
   LICENSE                 # Upstream MIT license (preserved)
   README.md               # Upstream documentation (preserved)
+tests/                    # pytest suite (`pip install -e ".[dev]"`, then `pytest`)
+packaging/linux/          # Desktop entry template + icon used by install.sh
+install.sh / uninstall.sh # Linux per-user install / removal
 pyproject.toml            # Build metadata + dependencies + `markitdown-gui` entry point
 requirements.txt          # Legacy install path; pyproject.toml is the source of truth
 README.md                 # This file
@@ -493,7 +693,8 @@ after MarkItDown finishes. It branches by source format and by mode:
 | PDF *(with Detect tables on)* | `text_content` already contains `<!--MDGUI_IMG:...-->` placeholders emitted by `PdfPlumberTableConverter` at each image's on-page y-position | Replaces every placeholder with a real `![](data:...)` URI (embed mode) or `![](images/<stem>_x<xref>.png)` link (file mode). One file or base64 blob per unique `xref`; multiple page references share it. |
 | PDF *(Detect tables off — fallback)* | Text only | Walks the PDF via PyMuPDF, dedupes by `xref`, appends an **Embedded images** section grouped by page (base64) or rasterises to PNG files (file mode). |
 | DOCX | Text + **truncated** `![](data:image/png;base64...)` placeholders per image-reference | Reads `word/media/` from the ZIP, sorts by trailing image number, then rewrites each placeholder in document order — to the real base64 bytes (embed mode) or to an on-disk file path (file mode). |
-| PPTX / XLSX / EPUB | Text only; images dropped | Reads `ppt/media/`, `xl/media/`, or walks the EPUB ZIP by image extension. Appends an **Embedded images** section (no on-page coordinates available). |
+| PPTX | `![alt](<shape name>.jpg)` per picture — a made-up filename that is never written | Converts with `keep_data_uris` so each picture carries its real bytes at its slide position, then embeds them (embed mode) or writes them to `images/` and links them (file mode). Without an image mode the made-up links are removed. |
+| XLSX / EPUB | Text only; images dropped | Reads `xl/media/`, or walks the EPUB ZIP by image extension. Appends an **Embedded images** section (no on-page coordinates available). |
 | Other (txt, html, csv…) | Text only | Logs `image extraction not supported for '<ext>' files` and exits cleanly. |
 
 In file mode, identical images share one file on disk — by **PDF xref**
@@ -530,6 +731,35 @@ Each item is then routed by `_pick_converter()`:
 The log shows the chosen route per file: `Converting [IMAGE-OCR]: …`,
 `Converting [OCR]: …`, or `Converting [text]: …`.
 
+### How the Google Drive source works
+
+1. **Listing** (`gdrive.list_drive_tree`, on a background thread when you
+   click *Add from Drive*) walks the folder breadth-first with
+   `files.list`, including Shared Drives. Folder and file names are
+   sanitised against the Windows-invalid character set and made unique per
+   folder; each convertible file becomes a `DriveEntry` (ID, MIME type,
+   relative folder, output stem, extension) stored on its queue item.
+2. **Conversion** — `ConversionWorker` connects once per run, then for each
+   Drive item downloads it into a temporary staging folder just before
+   converting: Google Docs / Sheets / Slides via `files.export` as
+   DOCX / XLSX / PPTX (falling back to the file's `exportLinks` when the
+   export exceeds Drive's 10 MB limit), other files via `files.get_media`.
+   From there the file follows the normal pipeline.
+3. **Links** — `gdrive.rewrite_drive_links` finds Markdown links whose
+   target is a Docs / Sheets / Slides / Drive URL (including Google's
+   `google.com/url?q=` redirect wrapper), and replaces those pointing at
+   another file in the same run with a relative path to its `.md`.
+   `#heading=…` anchors are dropped, as they have no Markdown equivalent.
+
+### How the per-folder index works
+
+Each queue item's output folder is its path relative to the input directory
+(local files) or to the Drive folder (Drive files), or the top level when
+mirroring is off. `MainWindow._collect_items()` sets
+`ConversionItem.generate_index` to *checkbox on* **and** *folder not in
+`index_excluded_folders`*; the worker uses that per-file flag for both the
+sidecar index and the table-of-contents removal.
+
 ### How the indexer works
 
 `build_index(markdown, source_name)` scans the converted file for:
@@ -551,7 +781,7 @@ Endpoints are grouped by their first path segment (`/api/account/...` →
 
 ### Vendored markitdown-ocr patches
 
-Three local patches in [`markitdown/packages/markitdown-ocr/`](markitdown/packages/markitdown-ocr/),
+Local patches in two files under [`markitdown/packages/markitdown-ocr/`](markitdown/packages/markitdown-ocr/),
 each annotated with `# Local patch (markitdown_gui):` comments:
 
 1. **`_pdf_converter_with_ocr.py`** — surfaces `ocr_result.error` in the
@@ -576,6 +806,13 @@ each annotated with `# Local patch (markitdown_gui):` comments:
 | OCR feels like it hangs | It's grinding through pages serially. Watch the log — you'll see `OCR page N/total…`. Each call takes 5-30 s on free tiers. |
 | "OCR was requested but markitdown-ocr is not installed" | Run `pip install markitdown-ocr openai`. |
 | File written but content is `*[OCR failed: ...]*` per page | Read the error message in the placeholder — auth, model, or rate-limit issue. Use Test OCR to verify the setup. |
+| Google sign-in: `Error 403: access_denied` in the browser | The OAuth consent screen is *External* and in *Testing* — add your account under **Test users**, or use an *Internal* app in your Workspace. |
+| Google sign-in: `redirect_uri_mismatch` / `invalid_client` | The client JSON isn't a **Desktop app** OAuth client. Create one of that type and select its file. |
+| `Missing dependency: googleapiclient` | Run `pip install google-api-python-client google-auth-oauthlib` (or reinstall with `pip install .`). |
+| `Cannot open the Drive folder …` | Wrong URL, or the signed-in account can't see the folder — open the URL in the browser with the same account; for a Shared Drive the account must be a member. |
+| `The saved Google sign-in no longer works` | The refresh token was revoked or expired (common for *Testing* apps after 7 days). Click **Sign out**, then **Sign in…** again. |
+| Drive file missing from the queue | It's a Form, Drawing, Site, shortcut, or an upload in an unsupported format — the log after *Add from Drive* lists what was skipped. |
+| Links in a converted Doc still point at Google | The linked Doc wasn't in the same run. Queue the whole folder tree and convert together. |
 
 ---
 
@@ -594,8 +831,9 @@ work done by the Microsoft AutoGen team:
   scanned-PDF handling, per-page progress, and per-request timeout.
 
 The GUI layer (`app/`), the `PdfPlumberTableConverter`, the indexer, the
-scan detector, the local-LLM discovery, the provider presets, and the
-config persistence are original code written for this project.
+Markdown cleanup, the scan detector, the local-LLM discovery, the provider
+presets, the Google Drive source, and the config persistence are original
+code written for this project.
 
 ### Third-party libraries
 

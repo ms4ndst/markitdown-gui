@@ -77,6 +77,9 @@ _METHOD_RE = re.compile(r"^(Get|Post|Put|Patch|Delete) method ?: ?/api/", re.IGN
 _TOC_LINE_RE = re.compile(r"(?:\.\s*){4,}\d{1,6}\s*$")
 _LIST_START_RE = re.compile(r"^\s*(?:\d+[.)]|[-*+•‣◦▪●○])\s")
 _BOLD_RE = re.compile(r"bold|black|heavy|semibold", re.IGNORECASE)
+# A sentence ending followed by another sentence: "Notera. Inställning …".
+# Two letters before the stop, so "1. Inledning" / "Kap. 3" don't count.
+_SENTENCE_BREAK_RE = re.compile(r"[^\W\d_]{2}[.!?]\s+[A-ZÅÄÖ]")
 
 
 def _cell(value: Any) -> str:
@@ -374,6 +377,10 @@ def _is_heading_worthy(text: str) -> bool:
         return False
     if "|" in text or _TOC_LINE_RE.search(text):
         return False
+    # A bullet ("● Kan nu erbjuda …") is a list item even when the slide or
+    # page sets it in a large font.
+    if _LIST_START_RE.match(text):
+        return False
     return True
 
 
@@ -442,6 +449,21 @@ def _render_text(lines: list[_Line], body: float) -> str:
             continue
         desc = "none"
 
+        # The wrapped tail of a bullet ("● Beställning … görs" / "direkt
+        # mellan kund och Inexchange") belongs to that bullet, whatever its
+        # font size — otherwise a big-font slide bullet's second line would
+        # become a heading.
+        if (
+            prev is not None
+            and prev[0] == 0
+            and tight
+            and _LIST_START_RE.match(prev[1])
+            and not unjoinable
+        ):
+            prev[1] = f"{prev[1]} {text}"
+            prev[2] = ln
+            continue
+
         level = None
         if len(text) <= 120 and _is_heading_worthy(text):
             level = _heading_level(ln.size, body)
@@ -462,6 +484,12 @@ def _render_text(lines: list[_Line], body: float) -> str:
 
     out: list[str] = []
     for lvl, text, _ in blocks:
+        # Joined big-font lines can add up to a paragraph (slides often set
+        # body text large): too long, or several sentences, is not a title.
+        if lvl and lvl != 3 and (
+            len(text) > 120 or _SENTENCE_BREAK_RE.search(text)
+        ):
+            lvl = 0
         out.append(f"{'#' * lvl} {text}" if lvl else text)
     return "\n\n".join(out).strip()
 
