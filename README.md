@@ -67,6 +67,38 @@ PNG/JPG/BMP/TIFF/GIF, MP3/WAV/M4A/FLAC, ZIP, and more.
   - HTTP-style endpoints (`GET /api/...`, `Get method : /api/...`)
 - Filters out repeated page headers/footers and code-like lines
 - Groups endpoints by their first path segment
+- **Per folder:** when the queued files span subfolders, **Folders…** next
+  to the checkbox opens the output folder tree. Each folder's tick covers
+  the files directly inside it; changing a folder changes every folder
+  below it, after which subfolders can still be set individually. The
+  checkbox itself stays the master switch, and the button shows how many
+  folders are on (`Folders… (2/3)`)
+
+### Google Drive as the source *(optional, read-only)*
+- Paste a Drive folder URL (My Drive or a Shared Drive), sign in once, and
+  click **Add from Drive** — every file in that folder and all its
+  subfolders is queued next to any local files
+- **Google Docs** are exported as DOCX, **Sheets** as XLSX and **Slides**
+  as PPTX, then converted through the normal pipeline — so tables, images
+  (embed / extract), cleanup and the index all behave as for local Office
+  files. Uploaded files in a supported format (PDF, DOCX, images, …) are
+  downloaded as-is; Forms, Drawings, shortcuts and unsupported files are
+  skipped and logged
+- The output directory gets the **same folder tree as the Drive folder**,
+  one `.md` per file. This is the reverse of
+  [Confluence L33ch](https://github.com/ms4ndst/confluence-l33ch)'s
+  *Upload to Google Docs*: a Confluence page with children (uploaded as a
+  folder holding a Doc of the same name plus the child Docs) comes back as
+  `<Page>/<Page>.md` plus the child `.md` files, and L33ch's `README` Doc
+  becomes `README.md`
+- Links between Docs (`docs.google.com/document/d/<id>/…`) are rewritten to
+  relative links between the converted `.md` files, so the tree navigates
+  offline. Links to Docs outside the queue are left pointing at Google
+- Names are sanitised for Windows and made unique per folder (two Docs
+  called *Notes* become `Notes.md` and `Notes (2).md`)
+- Files are downloaded into a temporary folder just before each is
+  converted and deleted when the run ends. Drive PDFs are probed for
+  scanned pages after download, so OCR routing still works
 
 ### Embed document images as base64 *(off by default)*
 - Works on **PDF, DOCX, PPTX, XLSX, EPUB** — not just PDFs
@@ -229,6 +261,13 @@ want it elsewhere.
 every supported file recursively. As PDFs are added they're probed for
 scan-vs-text status in the background; scanned ones get a **SCAN** badge.
 
+**Google Drive (optional):** in **Google Drive source**, choose the OAuth
+client file (a *Desktop app* OAuth client from a Google Cloud project with
+the **Google Drive API** enabled), click **Sign in…** and approve read-only
+access in the browser. Then paste the Drive folder URL and click
+**Add from Drive**. Keep *Mirror input folder structure* ticked to recreate
+the Drive folder tree in the output.
+
 ### 3. Toggle options
 - *Overwrite existing .md files* — needed if you re-run a conversion.
 - *Mirror input folder structure in output* — preserves subdirectories.
@@ -245,6 +284,8 @@ scan-vs-text status in the background; scanned ones get a **SCAN** badge.
   by PDF xref (PDFs) or SHA-256 (OOXML / EPUB). Off by default; mutually
   exclusive with base64.
 - *Generate index.md for large files* — only fires for outputs > 500 lines.
+  **Folders…** turns it on or off per output folder when the queue spans
+  subfolders.
 - *Strip page numbers in PDFs* — removes isolated page-number lines
   (`5`, `- 5 -`, `Page 5 of 20`) left as their own paragraphs. PDF-only.
 - *Strip headers/footers in PDFs/DOCX* — removes lines that repeat 3+ times
@@ -333,7 +374,13 @@ automatically — your API keys and preferences survive the change.
   "detect_tables": true,
   "embed_images": false,
   "extract_images": false,
+  "gdrive": {
+    "account": "you@example.com",
+    "client_file": "C:\\Users\\you\\client_secret.json",
+    "folder_url": "https://drive.google.com/drive/folders/1AbC..."
+  },
   "generate_index": true,
+  "index_excluded_folders": ["Archive", "Archive/2023"],
   "input_dir": "C:\\Users\\you\\Downloads",
   "mirror": true,
   "ocr": {
@@ -362,6 +409,10 @@ automatically — your API keys and preferences survive the change.
 
 The file is human-editable. Delete it any time to start clean.
 
+The Google sign-in is stored next to it as `google-token.json` (owner-only
+permissions; it holds a refresh token for **read-only** Drive access).
+**Sign out** deletes it.
+
 ---
 
 ## Architecture
@@ -371,6 +422,7 @@ app/
   main.py                 # QApplication entry point (`markitdown-gui` / `python -m app.main`)
   main_window.py          # MainWindow + FileListDelegate (SCAN badge)
   worker.py               # ConversionWorker (QThread), OcrConfig, per-file routing
+  gdrive.py               # Google Drive source — sign-in, folder listing, export, link rewriting
   pdf_table_converter.py  # PdfPlumberTableConverter — tables + font-size headings
   pdf_image_extractor.py  # Image extraction + inline-URI rewriting for PDF/OOXML/EPUB
   markdown_cleanup.py     # strip_empty_headings() — kills MD042 violations
@@ -554,6 +606,9 @@ config persistence are original code written for this project.
   fallback PDF text extraction
 - **[openai](https://github.com/openai/openai-python)** (Apache 2.0) —
   OpenAI-compatible client (only when OCR is enabled)
+- **[google-api-python-client](https://github.com/googleapis/google-api-python-client)**
+  and **[google-auth-oauthlib](https://github.com/googleapis/google-auth-library-python-oauthlib)**
+  (Apache 2.0) — Google Drive source (only when used)
 - **[PyMuPDF](https://github.com/pymupdf/PyMuPDF)** (AGPL) — used by
   markitdown-ocr for rendering pages of malformed PDFs
 

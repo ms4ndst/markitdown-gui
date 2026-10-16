@@ -8,3 +8,6 @@ markitdown[pdf,docx,xlsx,xls,pptx,outlook,audio-transcription]
 # Requires an OpenAI-compatible LLM endpoint (OpenAI, Azure OpenAI, LM Studio, etc.)
 markitdown-ocr
 openai
+# Optional: use a Google Drive folder as the conversion source.
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.0

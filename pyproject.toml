@@ -43,6 +43,11 @@ dependencies = [
     # and curate manually if you want a slimmer install.
     "markitdown-ocr",
     "openai",
+    # Google Drive as a conversion source (read-only Drive access). Imported
+    # lazily, so a `--no-deps` install without them still runs; the Drive
+    # buttons then report the missing package.
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.0",
 ]
 
 [project.optional-dependencies]

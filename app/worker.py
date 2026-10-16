@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from markitdown import MarkItDown
+
+from .gdrive import DriveEntry
 
 # Standalone image formats the built-in ImageConverter can send to a vision
 # model. Kept in sync with markitdown's ImageConverter.ACCEPTED_FILE_EXTENSIONS
@@ -33,6 +36,17 @@ class ConversionItem:
     source: Path
     destination: Path
     is_scanned: bool = False  # set by the GUI's scan detector for PDFs
+    # Per-file override of the worker-wide ``generate_index`` flag, so the
+    # sidecar index can be switched on or off folder by folder. None = use
+    # the worker-wide setting.
+    generate_index: bool | None = None
+    # Set for files that live in Google Drive: the worker downloads (or
+    # exports) them into a staging folder just before converting, and
+    # ``source`` is replaced with the staged copy.
+    drive: DriveEntry | None = None
+
+    def label(self) -> str:
+        return self.drive.display() if self.drive else str(self.source)
 
 
 @dataclass
@@ -74,6 +88,13 @@ class ConversionWorker(QObject):
         self._strip_pdf_headers_footers = strip_pdf_headers_footers
         self._ocr = ocr or OcrConfig()
         self._cancelled = False
+        self._drive_service = None
+        self._drive_creds = None
+        # Drive file ID -> output .md, for rewriting links between Docs.
+        self._drive_targets = {
+            item.drive.file_id: item.destination
+            for item in items if item.drive is not None
+        }
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -160,7 +181,11 @@ class ConversionWorker(QObject):
         if not self._ocr.enabled:
             return text_md, None, None
 
-        needs_ocr = any(item.is_scanned for item in self._items)
+        needs_ocr = any(
+            item.is_scanned
+            or (item.drive is not None and item.source.suffix.lower() == ".pdf")
+            for item in self._items
+        )
         needs_image = any(self._is_transcribable_image(i) for i in self._items)
 
         if not needs_ocr and not needs_image:
@@ -213,8 +238,48 @@ class ConversionWorker(QObject):
                 + ", ".join(sorted(set(names)))
             )
 
+    def _index_enabled(self, item: ConversionItem) -> bool:
+        if item.generate_index is None:
+            return self._generate_index
+        return item.generate_index
+
+    def _prepare_drive(self, staging: Path) -> None:
+        """Connect to Drive and point each Drive item at its staging path.
+
+        Nothing is downloaded yet — that happens per file in the main loop,
+        so a cancel stops the downloads too. Setting ``source`` up front
+        gives every item the right extension, which the converter routing
+        (images, scanned PDFs) keys on.
+        """
+        drive_items = [i for i in self._items if i.drive is not None]
+        if not drive_items:
+            return
+        from .gdrive import connect
+
+        self._drive_service, self._drive_creds = connect()
+        for item in drive_items:
+            entry = item.drive
+            item.source = staging / entry.rel_dir / (entry.stem + entry.extension)
+        self.log.emit(f"{len(drive_items)} file(s) will be fetched from Google Drive.")
+
+    def _fetch_drive_item(self, item: ConversionItem, ocr_md) -> None:
+        from .gdrive import download_entry
+
+        download_entry(self._drive_service, self._drive_creds, item.drive, item.source)
+        # Drive PDFs couldn't be probed when queued; do it now so a scanned
+        # one is still routed through OCR.
+        if ocr_md is not None and item.source.suffix.lower() == ".pdf":
+            from .scan_detector import is_scanned_pdf
+
+            item.is_scanned = is_scanned_pdf(str(item.source))
+
     def run(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="markitdown-gdrive-") as staging:
+            self._run(Path(staging))
+
+    def _run(self, staging: Path) -> None:
         try:
+            self._prepare_drive(staging)
             text_md, ocr_md, image_md = self._build_converters()
         except Exception as exc:
             self.log.emit("=" * 60)
@@ -256,18 +321,37 @@ class ConversionWorker(QObject):
                 self.log.emit("Conversion cancelled by user.")
                 break
 
-            md, route = self._pick_converter(item, text_md, ocr_md, image_md)
             self.progress.emit(index, total, item.source.name)
-            self.log.emit(f"Converting [{route}]: {item.source}")
+            generate_index = self._index_enabled(item)
 
             try:
                 if item.destination.exists() and not self._overwrite:
+                    self.log.emit(f"Converting: {item.label()}")
                     raise FileExistsError(
                         f"{item.destination.name} already exists (overwrite disabled)"
                     )
 
+                if item.drive is not None:
+                    self._fetch_drive_item(item, ocr_md)
+
+                md, route = self._pick_converter(item, text_md, ocr_md, image_md)
+                self.log.emit(f"Converting [{route}]: {item.label()}")
                 result = md.convert(str(item.source))
                 text_content = result.text_content
+
+                # Links between Google Docs point at docs.google.com; turn
+                # the ones to Docs converted in this run into relative links
+                # between the .md files, so the tree navigates offline.
+                if self._drive_targets:
+                    from .gdrive import rewrite_drive_links
+
+                    text_content, relinked = rewrite_drive_links(
+                        text_content, item.destination, self._drive_targets
+                    )
+                    if relinked:
+                        self.log.emit(
+                            f"  -> pointed {relinked} Drive link(s) at local .md files"
+                        )
 
                 images_md = ""
                 if self._embed_pdf_images:
@@ -435,7 +519,7 @@ class ConversionWorker(QObject):
                 # Runs before the lint pass so MD012/MD022 tidy the gap it
                 # leaves, and before the index is built below so the same
                 # cleaned text feeds both the main file and its index.
-                if self._generate_index:
+                if generate_index:
                     text_content, removed_toc = strip_table_of_contents(
                         text_content
                     )
@@ -489,7 +573,7 @@ class ConversionWorker(QObject):
                         "a vision model + API key."
                     )
 
-                if self._generate_index:
+                if generate_index:
                     from .indexer import build_index, should_index
 
                     # Build from the written text (TOC-stripped, lint-fixed) so
@@ -498,7 +582,10 @@ class ConversionWorker(QObject):
                     if should_index(text_content):
                         index_path = item.destination.with_suffix(".index.md")
                         index_path.write_text(
-                            build_index(text_content, item.source.name),
+                            build_index(
+                                text_content,
+                                item.drive.name if item.drive else item.source.name,
+                            ),
                             encoding="utf-8",
                         )
                         self.log.emit(f"  -> {index_path}")

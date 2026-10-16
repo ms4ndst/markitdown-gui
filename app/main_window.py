@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import threading
+from pathlib import Path, PurePosixPath
 
 from PySide6.QtCore import Qt, QByteArray, QRect, QSize, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
@@ -13,6 +14,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -32,12 +35,22 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
 from .config import config_path, load_config, save_config
+from .gdrive import (
+    DriveEntry,
+    DriveListWorker,
+    SignInWorker,
+    parse_folder_id,
+    sign_out,
+    token_path,
+)
 from .llm_discovery import (
     LocalLLMDiscovery,
     LocalServer,
@@ -59,6 +72,8 @@ from .worker import ConversionItem, ConversionWorker, OcrConfig, run_in_thread
 
 
 SCANNED_ROLE = Qt.ItemDataRole.UserRole + 1
+# DriveEntry.to_dict() for queue items that live in Google Drive.
+DRIVE_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
 _HELLO_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAMgAAABQCAIAAADTD63nAAAF5UlEQVR4nO3dX0hTbRwH8LP5sunZ0JpiVlArE7vQUAykzKgb+0u1JmYyL0ZgpGDdKBW1i/4LwXajFyH9YxpBNCJFikQohCal4W4MxaQwxH/o9OiSuRO8z/seJNsa8/zkPe/5fq5+cn7PeYR9d56dZwfViKLIAchNK/sZARAsoIIrFpBAsIAEggUkECwggWABCQQLSCBYQALBAhIIFpBAsIAEggUkECwggWABCQQLSCBYQALBAhIIFpBAsIAEggUkECxQbLB27typ+Vf0o4aGhqRRxcXFsv9WLpdLOv/4+HiUhyBKuGIBCQQLSCBYQALBAhIIFpBAsIAEggUk/g/BWlhYcLvdZWVlGRkZSUlJCQkJmzZtKioqunv37ujoKN28MzMzDQ0NFovFbDYbjUae581m86FDh1wuF3a/OJFeXl6e9GJEP+rLly/SKKvVGq7t+fPnZrM53GtvMBiuXbu2uLi4fKDT6ZTaxsbGojzEhEIhl8uVlJQUbl6j0RhuXpVQ9hXrxo0bVqt1aGgoXIMgCA6H49ixY4FAQK5Jg8Gg1Wq9cOHC9PR0uJ7Z2VmHw3H06FFBEDhVUnCwHjx4cPXqVfYXCQ0GQ01Njdfr9fv9gUBgYGCgoaFh69atrLO1tbWqqkqueSsqKjweD6t1Ol11dbXX652enhYEoaen59KlSzzPs6NtbW12u51Tp1VeCmOzfCn8+vVrQkICO5qenj4wMLB8XkEQLBaLdJK2traVL4Vv3ryRDqWlpXV3dy+ft6+vb+nq/PDhQ1F9lHrFcjqd8/PzHMfp9frW1tb09PTlPTzPP3nyJCMjg/1469atlc975coVVsTFxT179iw3N3d5T2Zm5suXL+Pj49mPN2/eXFxc5FRGkcESRfHRo0esPnXqVGZmZrhOvV5/7tw5Vr97925kZGQl837//v39+/estlgsBQUF4TqzsrLOnDnD6v7+/q6uLk5l/lrl+To6OqLsHBkZOX369G8P+Xy+yclJVu/fvz/yefbs2SPVb9++LSkp4WLV3t4u1TabLXJzeXl5fX09qzs6Onbt2sWpyWoHa9++fVF2RrjX6+npkWr736I85+DgILcCfX19Up2fnx+5OTc3V6fTLSws/DJQJRS5FMa8/TgxMSHLvFqtdt26dZGbdTqdyWSSZV4lUmSwpqamYhvIPu/HzO/3s4Ln+WiehjUYDKyYm5vjVGa1l0JZSBtFbJWJ8OFdXkajkRVzc3OiKP4xW/4lQeRURpFXrOTkZLk+NsU2bygU+uMN5vz8vHSHkZqayqmMIoO1ffv2GG4zVy4rK0uqvV5v5OYPHz5I21fbtm3jVEaRwcrPz5e2H5ubm9md1yooLCyU6qampsjNbrf7t1seKqHIYOn1eqvVyurh4eE7d+5EaHY4HCaTKTs7+8CBA9L2Zmw2b94sbYp6PJ7Ozs5wnT6f7/Hjx6zesGHD7t27ObVR6GMzvb29Wu0/7wqtVnvv3r3fnsTtdsfFxbG2NWvW+P3+FX5X2NLS8sfvCj9//rxlyxapzel0iuqj1GCJonj9+vWl75DDhw+3tLSMj4//+PHj27dvL168OHHixNKGxsZGWZ7Hkr6rYZtV58+fZ09VCILw6dOny5cvS7sMHMft3bs3GAyK6qPgYIVCocrKSi46tbW1vwyPOViBQOD48ePRTFpQUDA5OSmqkiI/YzEajaa+vv7+/ftpaWkR2tavX9/U1FRXVyfXvHq93uPx3L59OzExMVwPz/MOh6O9vX3t2rWcKilyg3Qpu91eWlr69OnTV69effz4cXR0dHZ21mAwbNy4MScn58iRIydPnpSe3JKLRqO5ePHi2bNn3W7369evfT7f2NhYMBhMSUnZsWPHwYMHbTbb0s02FdLgf0IDBQUvhfBfhmABCQQLSCBYQALBAhIIFpBAsIAEggUkECwggWABCQQLSCBYQALBAhIIFpBAsIAEggUkECwggWABCQQLSCBYQALBAhIIFpBAsIAEggUkECwggWABCQQLOAo/AcPczS8f0SU1AAAAAElFTkSuQmCC"
@@ -268,6 +283,113 @@ def _svg_pixmap(svg: str, size: QSize) -> QPixmap:
     return pixmap
 
 
+def _folder_label(rel_dir: str) -> str:
+    return rel_dir.rsplit("/", 1)[-1] if rel_dir else "(top level)"
+
+
+class IndexFoldersDialog(QDialog):
+    """Pick which output folders get sidecar ``.index.md`` files.
+
+    Each folder's checkbox covers the files directly inside it. Ticking or
+    unticking a folder applies the same to every folder below it, after
+    which subfolders can still be changed one by one.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        file_counts: dict[str, int],
+        excluded: set[str],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Generate index.md per folder")
+        self.resize(520, 480)
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Tick the folders whose large files should get a sidecar "
+            "<name>.index.md. Changing a folder also changes every folder "
+            "inside it."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("HintLabel")
+        layout.addWidget(hint)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Folder", "Queued files"])
+        layout.addWidget(self.tree, stretch=1)
+
+        # Every ancestor of a queued folder appears, even without files of
+        # its own, so the tree matches the output directory.
+        folders = set(file_counts)
+        for rel in list(folders):
+            parts = PurePosixPath(rel).parts if rel else ()
+            for depth in range(len(parts)):
+                folders.add("/".join(parts[:depth]))
+        self._items: dict[str, QTreeWidgetItem] = {}
+        for rel in sorted(folders, key=lambda r: (r.count("/") if r else -1, r.lower())):
+            parent_rel = rel.rpartition("/")[0] if "/" in rel else ("" if rel else None)
+            item = QTreeWidgetItem([_folder_label(rel), str(file_counts.get(rel, 0))])
+            item.setData(0, Qt.ItemDataRole.UserRole, rel)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                0,
+                Qt.CheckState.Unchecked if rel in excluded else Qt.CheckState.Checked,
+            )
+            if parent_rel is None:
+                self.tree.addTopLevelItem(item)
+            else:
+                self._items[parent_rel].addChild(item)
+            self._items[rel] = item
+        self.tree.expandAll()
+        self.tree.resizeColumnToContents(0)
+        self.tree.itemChanged.connect(self._cascade)
+
+        buttons = QHBoxLayout()
+        all_btn = QPushButton("All")
+        all_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        none_btn = QPushButton("None")
+        none_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        buttons.addWidget(all_btn)
+        buttons.addWidget(none_btn)
+        buttons.addStretch(1)
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        buttons.addWidget(box)
+        layout.addLayout(buttons)
+
+    def _cascade(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 0:
+            return
+        state = item.checkState(0)
+        self.tree.blockSignals(True)
+        stack = [item.child(i) for i in range(item.childCount())]
+        while stack:
+            child = stack.pop()
+            child.setCheckState(0, state)
+            stack.extend(child.child(i) for i in range(child.childCount()))
+        self.tree.blockSignals(False)
+        self.tree.viewport().update()
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        self.tree.blockSignals(True)
+        for item in self._items.values():
+            item.setCheckState(0, state)
+        self.tree.blockSignals(False)
+        self.tree.viewport().update()
+
+    def folders(self) -> set[str]:
+        return set(self._items)
+
+    def excluded(self) -> set[str]:
+        return {
+            rel for rel, item in self._items.items()
+            if item.checkState(0) != Qt.CheckState.Checked
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -279,6 +401,16 @@ class MainWindow(QMainWindow):
 
         self._thread = None
         self._worker: ConversionWorker | None = None
+
+        # Google Drive source. Sign-in and listing run on daemon threads
+        # (see _toggle_gdrive_sign_in); the workers are kept referenced here
+        # until they report back.
+        self._signin_worker: SignInWorker | None = None
+        self._drive_list_worker: DriveListWorker | None = None
+        self._gdrive_account = ""
+        # Output folders (relative POSIX paths, "" = top level) whose files
+        # get no sidecar index even though "Generate index.md" is on.
+        self._index_excluded: set[str] = set()
 
         self._scan_detector = ScanDetector(max_workers=2)
         self._scan_detector.result_ready.connect(self._on_scan_result)
@@ -303,6 +435,7 @@ class MainWindow(QMainWindow):
                                                        "input_dir", self._pick_input))
         body_layout.addLayout(self._build_directory_row("Output directory",
                                                        "output_dir", self._pick_output))
+        body_layout.addLayout(self._build_gdrive_rows())
 
         body_layout.addWidget(self._build_section_label("Files to convert"))
         body_layout.addLayout(self._build_file_controls())
@@ -322,8 +455,18 @@ class MainWindow(QMainWindow):
             "<name>.index.md listing headings and API endpoints with\n"
             "line numbers so Claude can jump straight to relevant sections.\n"
             "The document's own table of contents is removed from the main\n"
-            "file, since the sidecar index replaces it."
+            "file, since the sidecar index replaces it.\n"
+            "Use 'Folders…' to switch it on or off per output folder."
         )
+        self.index_folders_button = QPushButton("Folders…")
+        self.index_folders_button.setToolTip(
+            "Choose which output folders get index files — available when\n"
+            "the queued files span subfolders and the folder structure is\n"
+            "mirrored."
+        )
+        self.index_folders_button.clicked.connect(self._pick_index_folders)
+        self.generate_index_check.toggled.connect(self._refresh_index_folders)
+        self.mirror_check.toggled.connect(self._refresh_index_folders)
 
         self.detect_tables_check = QCheckBox("Detect tables in PDFs")
         self.detect_tables_check.setChecked(True)
@@ -385,6 +528,7 @@ class MainWindow(QMainWindow):
         general_row.addWidget(self.mirror_check)
         general_row.addSpacing(20)
         general_row.addWidget(self.generate_index_check)
+        general_row.addWidget(self.index_folders_button)
         general_row.addStretch(1)
         body_layout.addLayout(general_row)
 
@@ -434,6 +578,9 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._wire_persistence_signals()
         self._suppress_save = False
+        self._refresh_gdrive_account()
+        self._refresh_index_folders()
+        self.input_dir.textChanged.connect(self._refresh_index_folders)
 
     # --- Theme picker -------------------------------------------------
 
@@ -494,7 +641,8 @@ class MainWindow(QMainWindow):
 
     def _wire_persistence_signals(self) -> None:
         for line in (self.input_dir, self.output_dir,
-                     self.ocr_endpoint_edit, self.ocr_key_edit):
+                     self.ocr_endpoint_edit, self.ocr_key_edit,
+                     self.gdrive_url_edit, self.gdrive_client_edit):
             line.textChanged.connect(self._schedule_save)
         for cb in (self.overwrite_check, self.mirror_check,
                    self.detect_tables_check, self.generate_index_check,
@@ -524,6 +672,12 @@ class MainWindow(QMainWindow):
             "extract_images": self.extract_images_check.isChecked(),
             "strip_pagenumbers": self.strip_pagenumbers_check.isChecked(),
             "strip_headers_footers": self.strip_headers_footers_check.isChecked(),
+            "index_excluded_folders": sorted(self._index_excluded),
+            "gdrive": {
+                "folder_url": self.gdrive_url_edit.text(),
+                "client_file": self.gdrive_client_edit.text(),
+                "account": self._gdrive_account,
+            },
             "theme": {
                 "flavor": flavor_data.value if isinstance(flavor_data, Flavor) else "mocha",
                 "accent": accent_data if isinstance(accent_data, str) else "mauve",
@@ -558,6 +712,13 @@ class MainWindow(QMainWindow):
         ):
             if key in cfg:
                 widget.setChecked(bool(cfg[key]))
+        self._index_excluded = {
+            str(rel) for rel in cfg.get("index_excluded_folders") or []
+        }
+        gdrive = cfg.get("gdrive") or {}
+        self.gdrive_url_edit.setText(str(gdrive.get("folder_url") or ""))
+        self.gdrive_client_edit.setText(str(gdrive.get("client_file") or ""))
+        self._gdrive_account = str(gdrive.get("account") or "")
         ocr = cfg.get("ocr") or {}
         if "enabled" in ocr:
             self.ocr_check.setChecked(bool(ocr["enabled"]))
@@ -653,6 +814,55 @@ class MainWindow(QMainWindow):
         inner.addWidget(browse)
         row.addLayout(inner)
         return row
+
+    def _build_gdrive_rows(self) -> QVBoxLayout:
+        outer = QVBoxLayout()
+        outer.setSpacing(6)
+        outer.addWidget(self._build_section_label("Google Drive source"))
+
+        top = QHBoxLayout()
+        self.gdrive_url_edit = QLineEdit()
+        self.gdrive_url_edit.setPlaceholderText(
+            "https://drive.google.com/drive/folders/…  (folder in My Drive or a Shared Drive)"
+        )
+        self.gdrive_url_edit.setToolTip(
+            "The Drive folder to convert. 'Add from Drive' queues every Google\n"
+            "Doc, Sheet and Slides file in it and in all its subfolders, plus\n"
+            "uploaded files in a supported format. The output directory gets\n"
+            "the same folder tree, one .md per file — the reverse of\n"
+            "Confluence L33ch's 'Upload to Google Docs'."
+        )
+        top.addWidget(self.gdrive_url_edit, stretch=1)
+        self.gdrive_add_button = QPushButton("Add from Drive")
+        self.gdrive_add_button.clicked.connect(self._add_from_drive)
+        top.addWidget(self.gdrive_add_button)
+        self.gdrive_signin_button = QPushButton("Sign in…")
+        self.gdrive_signin_button.clicked.connect(self._toggle_gdrive_sign_in)
+        top.addWidget(self.gdrive_signin_button)
+        outer.addLayout(top)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(QLabel("OAuth client:"))
+        self.gdrive_client_edit = QLineEdit()
+        self.gdrive_client_edit.setPlaceholderText(
+            "client_secret_….json  (Desktop-app OAuth client, Drive API enabled)"
+        )
+        self.gdrive_client_edit.setToolTip(
+            "The OAuth client file Google sign-in needs: a 'Desktop app' OAuth\n"
+            "client in a Google Cloud project with the Google Drive API enabled.\n"
+            "Access requested is read-only\n"
+            "(https://www.googleapis.com/auth/drive.readonly)."
+        )
+        bottom.addWidget(self.gdrive_client_edit, stretch=1)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._pick_gdrive_client)
+        bottom.addWidget(browse)
+        outer.addLayout(bottom)
+
+        self.gdrive_account_label = QLabel("")
+        self.gdrive_account_label.setObjectName("HintLabel")
+        outer.addWidget(self.gdrive_account_label)
+        return outer
 
     def _build_ocr_row(self) -> QVBoxLayout:
         outer = QVBoxLayout()
@@ -1117,6 +1327,191 @@ class MainWindow(QMainWindow):
     def _update_count(self) -> None:
         n = self.file_list.count()
         self.count_label.setText(f"{n} file{'s' if n != 1 else ''} queued")
+        self._refresh_index_folders()
+
+    # --- Google Drive --------------------------------------------------
+
+    def _refresh_gdrive_account(self) -> None:
+        signed_in = token_path().is_file()
+        self.gdrive_signin_button.setText("Sign out" if signed_in else "Sign in…")
+        if signed_in:
+            who = self._gdrive_account or "a Google account"
+            self.gdrive_account_label.setText(f"Signed in to Google as {who}.")
+        else:
+            self.gdrive_account_label.setText(
+                "Not signed in. Choose the OAuth client file, then click 'Sign in…'."
+            )
+
+    def _pick_gdrive_client(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select the OAuth client file", self.gdrive_client_edit.text(),
+            "OAuth client (*.json);;All files (*.*)",
+        )
+        if path:
+            self.gdrive_client_edit.setText(str(Path(path)))
+
+    def _toggle_gdrive_sign_in(self) -> None:
+        if token_path().is_file():
+            sign_out()
+            self._gdrive_account = ""
+            self._schedule_save()
+            self.log_view.appendPlainText("Signed out of Google.")
+            self._refresh_gdrive_account()
+            return
+        if self._signin_worker is not None:
+            return
+        client = Path(self.gdrive_client_edit.text().strip())
+        if not client.is_file():
+            QMessageBox.warning(
+                self, "OAuth client file required",
+                "Select the OAuth client JSON file first (a 'Desktop app' "
+                "OAuth client with the Google Drive API enabled).",
+            )
+            return
+        self.gdrive_signin_button.setEnabled(False)
+        self.gdrive_account_label.setText(
+            "Waiting for you to approve access in the browser (5 min timeout)…"
+        )
+        worker = SignInWorker(client)
+        worker.finished.connect(self._on_gdrive_signed_in)
+        self._signin_worker = worker
+        # A daemon Python thread, not a QThread: the browser flow blocks
+        # until the user approves (up to its 5-minute timeout) and cannot be
+        # interrupted, and a QThread still running at window close aborts
+        # the process. The signal is queued back to the GUI thread.
+        threading.Thread(target=worker.run, daemon=True).start()
+
+    def _on_gdrive_signed_in(self, email: str, error: str) -> None:
+        self._signin_worker = None
+        self.gdrive_signin_button.setEnabled(True)
+        if error:
+            self.log_view.appendPlainText(f"! Google sign-in failed: {error}")
+            QMessageBox.warning(self, "Google sign-in failed", error)
+        else:
+            self._gdrive_account = email
+            self._schedule_save()
+            self.log_view.appendPlainText(f"Signed in to Google as {email}.")
+        self._refresh_gdrive_account()
+
+    def _add_from_drive(self) -> None:
+        if self._drive_list_worker is not None:
+            return
+        folder_id = parse_folder_id(self.gdrive_url_edit.text())
+        problem = ""
+        if not folder_id:
+            problem = (
+                "Paste the address of the Google Drive folder, e.g.\n"
+                "https://drive.google.com/drive/folders/1AbC…"
+            )
+        elif not token_path().is_file():
+            problem = "Sign in to Google first."
+        if problem:
+            QMessageBox.warning(self, "Cannot read Google Drive", problem)
+            return
+        self.gdrive_add_button.setEnabled(False)
+        self.gdrive_add_button.setText("Listing…")
+        self.statusBar().showMessage("Listing the Google Drive folder…")
+        self.log_view.appendPlainText(f"Listing Google Drive folder {folder_id}…")
+        worker = DriveListWorker(folder_id, set(SUPPORTED_EXTENSIONS))
+        worker.log.connect(self.log_view.appendPlainText)
+        worker.finished.connect(self._on_drive_listed)
+        self._drive_list_worker = worker
+        # Daemon thread for the same reason as sign-in: a slow listing must
+        # never hold up closing the window.
+        threading.Thread(target=worker.run, daemon=True).start()
+
+    def _on_drive_listed(self, root_name: str, entries: list, error: str) -> None:
+        self._drive_list_worker = None
+        self.gdrive_add_button.setEnabled(True)
+        self.gdrive_add_button.setText("Add from Drive")
+        if error:
+            self.log_view.appendPlainText(f"! {error}")
+            self.statusBar().showMessage("Listing Google Drive failed.")
+            QMessageBox.warning(self, "Cannot read Google Drive", error)
+            return
+        existing = {self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(self.file_list.count())}
+        added = 0
+        for data in entries:
+            entry = DriveEntry.from_dict(data)
+            key = f"gdrive:{entry.file_id}"
+            if key in existing:
+                continue
+            item = QListWidgetItem(entry.display())
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setData(DRIVE_ROLE, data)
+            item.setToolTip(
+                f"{entry.display()}\n\nConverted to "
+                f"{entry.rel_path}.md in the output directory."
+            )
+            self.file_list.addItem(item)
+            added += 1
+        if not self.mirror_check.isChecked() and any(
+            d.get("rel_dir") for d in entries
+        ):
+            self.log_view.appendPlainText(
+                "! 'Mirror input folder structure' is off — Drive subfolders "
+                "will be flattened into the output directory."
+            )
+        msg = f"Added {added} file(s) from Google Drive folder '{root_name}'."
+        self.log_view.appendPlainText(msg)
+        self.statusBar().showMessage(msg)
+        self._update_count()
+
+    # --- Per-folder index ----------------------------------------------
+
+    def _queued_rel_dir(self, list_item: QListWidgetItem) -> str:
+        """The output folder (relative POSIX path, "" = top level) a queued
+        file is written to."""
+        if not self.mirror_check.isChecked():
+            return ""
+        drive = list_item.data(DRIVE_ROLE)
+        if drive:
+            return drive.get("rel_dir", "")
+        in_root_text = self.input_dir.text().strip()
+        if not in_root_text:
+            return ""
+        src = Path(list_item.data(Qt.ItemDataRole.UserRole))
+        try:
+            rel = src.parent.relative_to(Path(in_root_text))
+        except ValueError:
+            return ""
+        return "" if str(rel) == "." else rel.as_posix()
+
+    def _queued_folder_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for i in range(self.file_list.count()):
+            rel = self._queued_rel_dir(self.file_list.item(i))
+            counts[rel] = counts.get(rel, 0) + 1
+        return counts
+
+    def _refresh_index_folders(self, *_args) -> None:
+        if not hasattr(self, "index_folders_button"):
+            return
+        counts = self._queued_folder_counts()
+        has_subfolders = any(rel for rel in counts)
+        self.index_folders_button.setEnabled(
+            self.generate_index_check.isChecked() and has_subfolders
+        )
+        excluded = {rel for rel in counts if rel in self._index_excluded}
+        if self.generate_index_check.isChecked() and has_subfolders and excluded:
+            self.index_folders_button.setText(
+                f"Folders… ({len(counts) - len(excluded)}/{len(counts)})"
+            )
+        else:
+            self.index_folders_button.setText("Folders…")
+
+    def _pick_index_folders(self) -> None:
+        counts = self._queued_folder_counts()
+        dialog = IndexFoldersDialog(self, counts, self._index_excluded)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        shown = dialog.folders()
+        # Keep exclusions for folders not in the current queue, so queueing
+        # a different subset doesn't forget earlier choices.
+        self._index_excluded = (self._index_excluded - shown) | dialog.excluded()
+        self._schedule_save()
+        self._refresh_index_folders()
 
     # --- Conversion ----------------------------------------------------
 
@@ -1131,9 +1526,26 @@ class MainWindow(QMainWindow):
         in_root = Path(in_root_text) if in_root_text else None
         mirror = self.mirror_check.isChecked() and in_root is not None
 
+        index_on = self.generate_index_check.isChecked()
         items: list[ConversionItem] = []
         for i in range(self.file_list.count()):
             list_item = self.file_list.item(i)
+            generate_index = (
+                index_on
+                and self._queued_rel_dir(list_item) not in self._index_excluded
+            )
+            drive = list_item.data(DRIVE_ROLE)
+            if drive:
+                entry = DriveEntry.from_dict(drive)
+                rel = entry.rel_path if self.mirror_check.isChecked() else entry.stem
+                items.append(ConversionItem(
+                    # Replaced by the staged download inside the worker.
+                    source=Path(entry.stem + entry.extension),
+                    destination=out_root / (rel + ".md"),
+                    generate_index=generate_index,
+                    drive=entry,
+                ))
+                continue
             src = Path(list_item.data(Qt.ItemDataRole.UserRole))
             is_scanned = bool(list_item.data(SCANNED_ROLE))
             if mirror:
@@ -1148,6 +1560,7 @@ class MainWindow(QMainWindow):
                 source=src,
                 destination=dest,
                 is_scanned=is_scanned,
+                generate_index=generate_index,
             ))
         return items
 
