@@ -66,6 +66,10 @@ markitdown-gui = "app.main:main"
 [tool.setuptools.dynamic]
 version = { attr = "app.__version__" }
 
+[tool.setuptools.package-data]
+# The app icon, installed by `markitdown-gui --install-desktop-entry`.
+app = ["resources/*.svg"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]

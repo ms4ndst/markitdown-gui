@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=MarkItDown GUI
-Comment=Batch-convert documents to Markdown
-Exec=@EXEC@ %f
-Icon=markitdown-gui
-Terminal=false
-Categories=Office;Utility;
-StartupWMClass=MarkItDown

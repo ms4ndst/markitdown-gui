@@ -13,6 +13,17 @@ from .theme import ACCENTS, DEFAULT_ACCENT, DEFAULT_FLAVOR, Flavor, apply_catppu
 
 
 def main() -> int:
+    from .desktop_entry import DESKTOP_ID, run_cli
+
+    exit_code = run_cli(sys.argv[1:])
+    if exit_code is not None:
+        return exit_code
+
+    # The Wayland app_id / X11 WM_CLASS that matches the installed desktop
+    # entry (markitdown-gui.desktop). Without it the window identifies as
+    # "python3", so sway, waybar and launchers can't tie it to its entry
+    # and icon. Must be set before the first window is created.
+    QApplication.setDesktopFileName(DESKTOP_ID)
     app = QApplication(sys.argv)
     # Org name is part of the QStandardPaths config-dir lookup; keeping it
     # at "MarkItDown" makes the config path neutral. The config module

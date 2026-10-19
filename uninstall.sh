@@ -9,7 +9,11 @@ DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 
 rm -rf "$DATA_DIR/$APP_NAME"
-rm -f "$BIN_DIR/markitdown-gui"
+# Only the launcher symlink install.sh created — not a `pip install --user`
+# launcher script that happens to have the same name.
+if [ -L "$BIN_DIR/markitdown-gui" ]; then
+    rm -f "$BIN_DIR/markitdown-gui"
+fi
 rm -f "$DATA_DIR/applications/markitdown-gui.desktop"
 rm -f "$DATA_DIR/icons/hicolor/scalable/apps/markitdown-gui.svg"
 

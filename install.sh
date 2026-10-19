@@ -12,8 +12,6 @@ DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 INSTALL_DIR="$DATA_DIR/$APP_NAME"
 VENV_DIR="$INSTALL_DIR/venv"
-ICON_DIR="$DATA_DIR/icons/hicolor/scalable/apps"
-DESKTOP_DIR="$DATA_DIR/applications"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "Error: python3 is required but was not found on PATH." >&2
@@ -38,26 +36,31 @@ fi
 "$VENV_DIR/bin/pip" install --upgrade pip --quiet
 "$VENV_DIR/bin/pip" install "$REPO_DIR"
 
-mkdir -p "$BIN_DIR" "$ICON_DIR" "$DESKTOP_DIR"
+mkdir -p "$BIN_DIR"
 
-install -m644 "$REPO_DIR/packaging/linux/markitdown-gui.svg" "$ICON_DIR/markitdown-gui.svg"
-
-sed "s|@EXEC@|$VENV_DIR/bin/markitdown-gui|" \
-    "$REPO_DIR/packaging/linux/markitdown-gui.desktop.in" > "$DESKTOP_DIR/markitdown-gui.desktop"
-chmod 644 "$DESKTOP_DIR/markitdown-gui.desktop"
+# Desktop entry + icon, pointing at this venv's launcher. The app writes
+# them itself, so a plain `pip install` can do the same.
+"$VENV_DIR/bin/markitdown-gui" --install-desktop-entry
 
 ln -sf "$VENV_DIR/bin/markitdown-gui" "$BIN_DIR/markitdown-gui"
-
-if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
-fi
-if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache -f "$DATA_DIR/icons/hicolor" >/dev/null 2>&1 || true
-fi
 
 echo
 echo "Installed. Launch MarkItDown GUI from your application menu, or run:"
 echo "  $BIN_DIR/markitdown-gui"
+
+# A `pip install --user .` copy puts MarkItDown's own command-line tool,
+# `markitdown`, next to the launcher. In a run menu (rofi -show run) it
+# sorts above `markitdown-gui`, and starting it opens no window — it waits
+# for a document on stdin. Reinstalling it also overwrites the launcher.
+USER_SITE="$(python3 -m site --user-site 2>/dev/null || true)"
+if [ -n "$USER_SITE" ] && ls "$USER_SITE"/markitdown_gui-*.dist-info >/dev/null 2>&1; then
+    echo
+    echo "Note: a separate 'pip install --user' copy of markitdown-gui is also"
+    echo "installed. It adds a 'markitdown' command (MarkItDown's CLI, no window)"
+    echo "that run menus list above 'markitdown-gui'. Remove it with:"
+    echo "  python3 -m pip uninstall markitdown-gui"
+    echo "(and 'python3 -m pip uninstall markitdown' if nothing else needs it)."
+fi
 
 case ":${PATH:-}:" in
     *":$BIN_DIR:"*) ;;

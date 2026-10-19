@@ -489,6 +489,15 @@ def _build_stylesheet(p: Palette, accent_name: str) -> str:
     QScrollBar::handle:vertical:hover {{ background: {accent}; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
     QScrollBar::add-page:vertical,  QScrollBar::sub-page:vertical  {{ background: transparent; }}
+    QScrollBar:horizontal {{
+        background: transparent; height: 10px; margin: 0; border: none;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {p.surface2}; min-width: 24px; border-radius: 5px;
+    }}
+    QScrollBar::handle:horizontal:hover {{ background: {accent}; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+    QScrollBar::add-page:horizontal,  QScrollBar::sub-page:horizontal  {{ background: transparent; }}
     """
 
 

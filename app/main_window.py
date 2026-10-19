@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QScrollArea,
     QSpacerItem,
     QStatusBar,
     QStyle,
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .config import config_path, load_config, save_config
+from .flow_layout import FlowLayout, group
 from .gdrive import (
     DriveEntry,
     DriveListWorker,
@@ -542,29 +544,28 @@ class MainWindow(QMainWindow):
             "from real content)."
         )
 
-        general_row = QHBoxLayout()
-        general_row.addWidget(self.overwrite_check)
-        general_row.addSpacing(20)
-        general_row.addWidget(self.mirror_check)
-        general_row.addSpacing(20)
-        general_row.addWidget(self.generate_index_check)
-        general_row.addWidget(self.index_folders_button)
-        general_row.addSpacing(20)
-        general_row.addWidget(self.normalize_headings_check)
-        general_row.addStretch(1)
+        # Wrapping rows: in a narrow window (e.g. half a screen under a
+        # tiling window manager) the options flow onto more lines instead of
+        # being cut off or drawn over each other.
+        general_row = FlowLayout()
+        for widget in (
+            self.overwrite_check,
+            self.mirror_check,
+            group(self.generate_index_check, self.index_folders_button),
+            self.normalize_headings_check,
+        ):
+            general_row.addWidget(widget)
         body_layout.addLayout(general_row)
 
-        pdf_row = QHBoxLayout()
-        pdf_row.addWidget(self.detect_tables_check)
-        pdf_row.addSpacing(20)
-        pdf_row.addWidget(self.embed_images_check)
-        pdf_row.addSpacing(20)
-        pdf_row.addWidget(self.extract_images_check)
-        pdf_row.addSpacing(20)
-        pdf_row.addWidget(self.strip_pagenumbers_check)
-        pdf_row.addSpacing(20)
-        pdf_row.addWidget(self.strip_headers_footers_check)
-        pdf_row.addStretch(1)
+        pdf_row = FlowLayout()
+        for widget in (
+            self.detect_tables_check,
+            self.embed_images_check,
+            self.extract_images_check,
+            self.strip_pagenumbers_check,
+            self.strip_headers_footers_check,
+        ):
+            pdf_row.addWidget(widget)
         body_layout.addLayout(pdf_row)
 
         body_layout.addLayout(self._build_ocr_row())
@@ -582,9 +583,34 @@ class MainWindow(QMainWindow):
         self.log_view.setMinimumHeight(140)
         body_layout.addWidget(self.log_view, stretch=1)
 
-        body_layout.addLayout(self._build_action_row())
 
-        root.addWidget(body, stretch=1)
+        # Scroll rather than squeeze: the options need ~1200 px of height,
+        # and a tiling window manager (sway, i3) sizes the window to its tile
+        # regardless of that minimum — Qt then draws rows over each other
+        # (the option row landing inside the file list). In a scroll area
+        # the content keeps its minimum and a scrollbar appears instead.
+        scroll = QScrollArea()
+        scroll.setObjectName("BodyScroll")
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Transparent, so the window's Catppuccin background shows through.
+        scroll.setStyleSheet(
+            "QScrollArea#BodyScroll, QScrollArea#BodyScroll > QWidget > QWidget"
+            " { background: transparent; }"
+        )
+        scroll.viewport().setAutoFillBackground(False)
+        body.setAutoFillBackground(False)
+        root.addWidget(scroll, stretch=1)
+
+        # Count / Cancel / Convert stay outside the scroll area, so they are
+        # always visible however short the window is.
+        actions = QWidget()
+        actions_layout = QVBoxLayout(actions)
+        actions_layout.setContentsMargins(32, 8, 32, 12)
+        actions_layout.addLayout(self._build_action_row())
+        root.addWidget(actions)
 
         status = QStatusBar()
         status.showMessage("Ready.")
@@ -913,8 +939,8 @@ class MainWindow(QMainWindow):
         top.addWidget(self.ocr_test_button)
         outer.addLayout(top)
 
-        fields = QHBoxLayout()
-        fields.setSpacing(8)
+        # Each label stays with its field; the groups wrap in a narrow window.
+        fields = FlowLayout(h_spacing=16, v_spacing=8)
 
         provider_lbl = QLabel("Provider:")
         self.ocr_provider_combo = QComboBox()
@@ -942,6 +968,8 @@ class MainWindow(QMainWindow):
 
         endpoint_lbl = QLabel("Endpoint:")
         self.ocr_endpoint_edit = QLineEdit()
+        # A flow layout doesn't stretch fields, so give the URL room.
+        self.ocr_endpoint_edit.setMinimumWidth(340)
         self.ocr_endpoint_edit.setPlaceholderText(
             "(blank = OpenAI default; LM Studio: http://localhost:1234/v1; "
             "Ollama: http://localhost:11434/v1)"
@@ -958,18 +986,17 @@ class MainWindow(QMainWindow):
         self.ocr_key_edit = QLineEdit()
         self.ocr_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.ocr_key_edit.setPlaceholderText("(blank = use OPENAI_API_KEY env var)")
-        self.ocr_key_edit.setMaximumWidth(220)
+        self.ocr_key_edit.setFixedWidth(220)
         self.ocr_key_edit.setToolTip(
             "Saved to disk in your config file (plain text). "
             "Leave blank to use the OPENAI_API_KEY environment variable instead."
         )
 
-        for w in (provider_lbl, self.ocr_provider_combo,
-                  model_lbl, self.ocr_model_combo,
-                  endpoint_lbl, self.ocr_endpoint_edit,
-                  self.ocr_detect_button,
-                  key_lbl, self.ocr_key_edit):
-            fields.addWidget(w)
+        for widgets in ((provider_lbl, self.ocr_provider_combo),
+                        (model_lbl, self.ocr_model_combo),
+                        (endpoint_lbl, self.ocr_endpoint_edit, self.ocr_detect_button),
+                        (key_lbl, self.ocr_key_edit)):
+            fields.addWidget(group(*widgets))
         outer.addLayout(fields)
 
         self._ocr_field_widgets = [

@@ -323,12 +323,12 @@ of the app runs fine without them (the Drive buttons then report the
 missing package) — use `pip install --no-deps .` and curate manually if
 you want a leaner footprint.
 
-### Linux installer
+### Linux installer (recommended on Linux)
 
 On Linux, [`install.sh`](install.sh) sets up a dedicated venv under
 `~/.local/share/markitdown-gui`, a `markitdown-gui` launcher on
 `~/.local/bin`, and a desktop entry + icon so the app shows up in your
-application menu:
+application menu (GNOME, KDE, rofi's *Apps* / `drun`, …):
 
 ```bash
 git clone <this-repo>
@@ -336,10 +336,35 @@ cd markitdown_gui
 ./install.sh
 ```
 
-Run [`uninstall.sh`](uninstall.sh) to remove everything it created (your
-config/API key under `~/.config/MarkItDown/` is left in place). Packaging
-files (icon, `.desktop` template) live under
-[`packaging/linux/`](packaging/linux/).
+Run it again to update. Run [`uninstall.sh`](uninstall.sh) to remove
+everything it created (your config/API key under `~/.config/MarkItDown/`
+is left in place).
+
+**Use one install method, not both.** `pip install --user .` and
+`install.sh` both write `~/.local/bin/markitdown-gui`, and the pip one also
+puts MarkItDown's own command-line tool, `markitdown`, on your PATH. In a
+run menu (`rofi -show run`) that `markitdown` entry sorts above
+`markitdown-gui`; starting it opens no window — it waits for a document on
+stdin — so the app seems not to start. `install.sh` warns when it finds a
+`--user` copy; remove it with `python3 -m pip uninstall markitdown-gui`
+(and `python3 -m pip uninstall markitdown` if nothing else uses it).
+
+### Application-menu entry for a pip install
+
+pip only installs commands, so after `pip install .` the app is not in your
+application menu yet. Add it (and its icon) with:
+
+```bash
+markitdown-gui --install-desktop-entry
+```
+
+This writes `~/.local/share/applications/markitdown-gui.desktop`, pointing
+at the `markitdown-gui` you ran, plus the icon under
+`~/.local/share/icons/hicolor/scalable/apps/` (`$XDG_DATA_HOME` is honoured).
+`markitdown-gui --uninstall-desktop-entry` removes both. `install.sh` uses
+the same command. The window's Wayland `app_id` / X11 `WM_CLASS` is
+`markitdown-gui`, matching the entry, so sway, waybar, docks and task
+switchers show it with its own name and icon.
 
 ---
 
@@ -627,6 +652,7 @@ app/
   scan_detector.py        # Async pdfplumber-based scanned-PDF detection
   llm_discovery.py        # Provider presets + local LLM probing
   config.py               # JSON config load/save (QStandardPaths)
+  desktop_entry.py        # --install-desktop-entry: Linux .desktop file + icon
   theme.py                # Catppuccin palettes (4 flavors) + Qt stylesheet + cat hero icon
 markitdown/               # Vendored upstream MarkItDown source (see Credits)
   packages/
@@ -635,7 +661,7 @@ markitdown/               # Vendored upstream MarkItDown source (see Credits)
   LICENSE                 # Upstream MIT license (preserved)
   README.md               # Upstream documentation (preserved)
 tests/                    # pytest suite (`pip install -e ".[dev]"`, then `pytest`)
-packaging/linux/          # Desktop entry template + icon used by install.sh
+app/resources/            # App icon (installed with the desktop entry)
 install.sh / uninstall.sh # Linux per-user install / removal
 pyproject.toml            # Build metadata + dependencies + `markitdown-gui` entry point
 requirements.txt          # Legacy install path; pyproject.toml is the source of truth
@@ -811,6 +837,8 @@ each annotated with `# Local patch (markitdown_gui):` comments:
 | `Missing dependency: googleapiclient` | Run `pip install google-api-python-client google-auth-oauthlib` (or reinstall with `pip install .`). |
 | `Cannot open the Drive folder …` | Wrong URL, or the signed-in account can't see the folder — open the URL in the browser with the same account; for a Shared Drive the account must be a member. |
 | `The saved Google sign-in no longer works` | The refresh token was revoked or expired (common for *Testing* apps after 7 days). Click **Sign out**, then **Sign in…** again. |
+| Linux: app not in the application menu after `pip install` | pip can't add menu entries. Run `markitdown-gui --install-desktop-entry`, or install with `./install.sh`. |
+| Linux: picking "markitdown" in rofi's Run menu opens nothing | That entry is MarkItDown's CLI (from a `pip install --user` copy), not the GUI. Pick `markitdown-gui`, or use the *Apps* menu — and see [Linux installer](#linux-installer-recommended-on-linux) to remove the duplicate install. |
 | Drive file missing from the queue | It's a Form, Drawing, Site, shortcut, or an upload in an unsupported format — the log after *Add from Drive* lists what was skipped. |
 | Links in a converted Doc still point at Google | The linked Doc wasn't in the same run. Queue the whole folder tree and convert together. |
 
