@@ -1587,8 +1587,13 @@ class MainWindow(QMainWindow):
 
         index_on = self.generate_index_check.isChecked()
         items: list[ConversionItem] = []
-        for i in range(self.file_list.count()):
-            list_item = self.file_list.item(i)
+        selected = self.file_list.selectedItems()
+        # Convert only the rows the user selected; fall back to all
+        # rows when nothing is selected.
+        list_items = selected if selected else [
+            self.file_list.item(i) for i in range(self.file_list.count())
+        ]
+        for list_item in list_items:
             generate_index = (
                 index_on
                 and self._queued_rel_dir(list_item) not in self._index_excluded
